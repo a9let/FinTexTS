@@ -116,11 +116,13 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 class TextModel(nn.Module):
-    def __init__(self, hidden_size, pred_len, num_layers):
+    def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes):
         super(TextModel, self).__init__()
         self.relu = nn.ReLU()
         self.num_layers = num_layers
-
+        self.used_col_prefixes = used_col_prefixes
+        self.softmax = nn.Softmax(dim=0)
+        self.G = nn.Parameter(torch.zeros(len(used_col_prefixes)))
         if num_layers <= 1:
             self.layers = nn.ModuleList([nn.Linear(384, pred_len)])
         else:
@@ -129,15 +131,21 @@ class TextModel(nn.Module):
                 layers.append(nn.Linear(hidden_size, hidden_size))
             layers.append(nn.Linear(hidden_size, pred_len))
             self.layers = nn.ModuleList(layers)
-
+        
+                
     def forward(self, price_x, x):
         ori_x = x.clone()
+        weights = self.softmax(self.G)
+        weights = weights.view(1, len(self.used_col_prefixes), 1)
+        x = x*weights
+        x =x.sum(dim = 1)
         for i, layer in enumerate(self.layers):
             x = layer(x)
-            if i < len(self.layers) - 1:
+            if i < len(self.layers) - 1 :
                 x = self.relu(x)
+        
         out = x.unsqueeze(-1).repeat(1, 1, price_x.shape[1]) + price_x.unsqueeze(1).repeat(1, x.shape[1], 1)
-        valid_mask = (ori_x.abs().sum(1) >= 1e-6).view(-1, 1, 1).float()
+        valid_mask = (ori_x.abs().sum(dim=[1, 2]) >= 1e-6).view(-1, 1, 1).float()
         return out * valid_mask
 
 def _prepare_batch(batch, device, pred_len, label_len):

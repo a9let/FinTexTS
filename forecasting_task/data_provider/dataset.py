@@ -51,17 +51,29 @@ class Dataset_Custom(Dataset):
         ddf_raw = df_raw[["date"]]
         pdf_raw = df_raw[["open", "high", "low", "close"]]
         tdf_raw = []
+        # for prefix in self.used_col_prefixes:
+        #     tmp = df_raw[[f"{prefix}_emb{i}" for i in range(384)]].reset_index()
+        #     col_name = {"index": "stan"}
+        #     for i in range(384):
+        #         col_name.update({f"{prefix}_emb{i}": f"emb{i}"})
+        #     tmp.rename(columns=col_name, inplace=True)
+        #     tdf_raw.append(tmp)
+        # # tdf_raw
+
+
+        # ### authors used mean of embeddings for each date, but there are only one embedding for each group, so authors used some aggregation before.
+
+
+        # tdf_raw = pd.concat(tdf_raw, axis=0).groupby("stan").apply(lambda x: x.mean())
+        # tdf_raw = tdf_raw[[f"emb{i}" for i in range(384)]]
+
         for prefix in self.used_col_prefixes:
-            tmp = df_raw[[f"{prefix}_emb{i}" for i in range(384)]].reset_index()
-            col_name = {"index": "stan"}
-            for i in range(384):
-                col_name.update({f"{prefix}_emb{i}": f"emb{i}"})
-            tmp.rename(columns=col_name, inplace=True)
+            tmp = df_raw[[f"{prefix}_emb{i}" for i in range(384)]]
+            tmp = tmp.to_numpy(dtype=np.float32)
             tdf_raw.append(tmp)
         # tdf_raw
-        tdf_raw = pd.concat(tdf_raw, axis=0).groupby("stan").apply(lambda x: x.mean())
-        tdf_raw = tdf_raw[[f"emb{i}" for i in range(384)]]
-
+        tdf_raw = np.stack(tdf_raw, axis = 1)
+       
         # Train/val/test split
 
         num_train = len(ddf_raw[ddf_raw["date"] < "2022-01-01"])
@@ -80,6 +92,10 @@ class Dataset_Custom(Dataset):
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
 
+
+        ### authors used scaler on the whole dataset, not just the training set, that led to data leakage. 
+
+        
         train_pdate = pdf_raw[border1:border2]
         self.scaler.fit(pdf_raw.values)
         pdate = self.scaler.transform(pdf_raw.values)
@@ -92,7 +108,7 @@ class Dataset_Custom(Dataset):
         data_stamp = df_stamp.drop(["date"], axis=1).values
 
         self.data_price_x = pdate[border1:border2]
-        self.data_text_x = tdf_raw[border1:border2].fillna(0)
+        self.data_text_x = np.where(np.isnan(tdf_raw[border1:border2]), 0, tdf_raw[border1:border2])
         self.data_price_y = pdate[border1:border2]
         self.data_stamp = data_stamp
 
@@ -105,7 +121,7 @@ class Dataset_Custom(Dataset):
         # Multivariate: use all features, Univariate: use single feature (channel-independence)
         seq_price_x = self.data_price_x[s_begin:s_end]
         seq_price_y = self.data_price_y[r_begin:r_end]
-        seq_text_x = self.data_text_x[s_begin:s_end].values
+        seq_text_x = self.data_text_x[s_begin:s_end]
 
         seq_x_mark = self.data_stamp[s_begin:s_end]
         seq_y_mark = self.data_stamp[r_begin:r_end]
