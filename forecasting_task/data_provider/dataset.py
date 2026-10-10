@@ -44,7 +44,7 @@ class Dataset_Custom(Dataset):
         df_raw = pd.read_parquet(os.path.join(self.root_path, self.data_path))
         if "fnspid" in self.data_path:
             df_raw = df_raw.ffill()
-        
+
         df_raw = df_raw[
             ("2019-01-01" <= df_raw["date"]) & (df_raw["date"] < "2023-12-19")
         ].reset_index(drop=True)
@@ -73,7 +73,7 @@ class Dataset_Custom(Dataset):
             tdf_raw.append(tmp)
         # tdf_raw
         tdf_raw = np.stack(tdf_raw, axis = 1)
-       
+
         # Train/val/test split
 
         num_train = len(ddf_raw[ddf_raw["date"] < "2022-01-01"])
@@ -91,13 +91,9 @@ class Dataset_Custom(Dataset):
         border2s = [num_train, num_train + num_vali, len(df_raw)]
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
-
-
-        ### authors used scaler on the whole dataset, not just the training set, that led to data leakage. 
-
-        
-        train_pdate = pdf_raw[border1:border2]
-        self.scaler.fit(pdf_raw.values)
+        # Fit on training prices only; use the same scaling for all splits.
+        train_prices = pdf_raw.iloc[:num_train]
+        self.scaler.fit(train_prices.values)
         pdate = self.scaler.transform(pdf_raw.values)
 
         df_stamp = ddf_raw[["date"]][border1:border2].copy()
