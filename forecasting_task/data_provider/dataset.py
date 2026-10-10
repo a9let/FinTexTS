@@ -80,8 +80,9 @@ class Dataset_Custom(Dataset):
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
 
-        train_pdate = pdf_raw[border1:border2]
-        self.scaler.fit(pdf_raw.values)
+        # Fit on training prices only; use the same scaling for all splits.
+        train_prices = pdf_raw.iloc[:num_train]
+        self.scaler.fit(train_prices.values)
         pdate = self.scaler.transform(pdf_raw.values)
 
         df_stamp = ddf_raw[["date"]][border1:border2].copy()
