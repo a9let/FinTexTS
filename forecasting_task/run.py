@@ -302,6 +302,7 @@ if __name__ == "__main__":
         hidden_size=args.text_hidden_size,
         pred_len=args.pred_len,
         num_layers=args.text_num_layers,
+        used_col_prefixes=args.used_col_prefixes,
     ).to(device)
 
     optimizer = torch.optim.Adam(
