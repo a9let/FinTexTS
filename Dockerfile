@@ -34,6 +34,17 @@ RUN python -m pip install \
 # Record all installed Python package versions.
 RUN python -m pip freeze > /opt/requirements-resolved.txt
 
+# Match the container user's IDs to the server user.
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+RUN groupadd --gid ${USER_GID} researcher \
+    && useradd --uid ${USER_UID} --gid ${USER_GID} \
+       --create-home --shell /bin/bash researcher
+
+ENV HOME=/home/researcher
+USER researcher
+
 WORKDIR /workspace/FinTexTS
 
 CMD ["sleep", "infinity"]
