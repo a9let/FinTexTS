@@ -1,7 +1,9 @@
 import argparse
+from email import parser
 import os
 import random
 
+from forecasting_task.text_models.gru import GRUTextModel
 import numpy as np
 import torch
 import torch.nn as nn
@@ -59,7 +61,7 @@ def parse_args():
     parser.add_argument("--patch_len", type=int, default=8)
     parser.add_argument("--d_model", type=int, default=64)
     parser.add_argument("--n_heads", type=int, default=4)
-    parser.add_argument("--dropout", type=int, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--e_layers", type=int, default=2)
     parser.add_argument("--d_ff", type=int, default=64)
     
@@ -82,7 +84,8 @@ def parse_args():
         type=str,
         default="logs/tmp_test",
     )
-    
+    parser.add_argument("--gru_hidden_size", type=int, default=64)
+    parser.add_argument("--gru_num_layers", type=int, default=1)
     parser.add_argument('--decomp_method', type=str, default='moving_avg',
                         help='method of series decompsition, only support moving_avg or dft_decomp')
     parser.add_argument('--channel_independence', type=int, default=1,
@@ -116,29 +119,31 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 class TextModel(nn.Module):
-    def __init__(self, hidden_size, pred_len, num_layers):
+    def __init__(self, hidden_size, pred_len, num_layers, input_size, gru_hidden_size, gru_num_layers):
         super(TextModel, self).__init__()
         self.relu = nn.ReLU()
         self.num_layers = num_layers
-
+        self.history_encoder = GRUTextModel(gru_hidden_size, gru_num_layers, input_size)
         if num_layers <= 1:
-            self.layers = nn.ModuleList([nn.Linear(384, pred_len)])
+            self.layers = nn.ModuleList([nn.Linear(gru_hidden_size, pred_len)])
         else:
-            layers = [nn.Linear(384, hidden_size)]
+            layers = [nn.Linear(gru_hidden_size, hidden_size)]
             for _ in range(num_layers - 2):
                 layers.append(nn.Linear(hidden_size, hidden_size))
             layers.append(nn.Linear(hidden_size, pred_len))
             self.layers = nn.ModuleList(layers)
 
-    def forward(self, price_x, x):
-        ori_x = x.clone()
+    def forward(self, price_x, seq_text_x):
+        x = seq_text_x.clone()
+        x = self.history_encoder(x)
+        has_text = seq_text_x.abs().sum(dim=(1, 2)) >= 1e-6
+        has_text = has_text.view(-1,1,1)
         for i, layer in enumerate(self.layers):
             x = layer(x)
             if i < len(self.layers) - 1:
                 x = self.relu(x)
         out = x.unsqueeze(-1).repeat(1, 1, price_x.shape[1]) + price_x.unsqueeze(1).repeat(1, x.shape[1], 1)
-        valid_mask = (ori_x.abs().sum(1) >= 1e-6).view(-1, 1, 1).float()
-        return out * valid_mask
+        return out * has_text
 
 def _prepare_batch(batch, device, pred_len, label_len):
     seq_price_x, seq_price_y, seq_text_x, seq_x_mark, seq_y_mark, _ = batch
@@ -190,7 +195,7 @@ def _run_epoch(
 
         output = model(seq_price_x, seq_x_mark, dec_inp, seq_y_mark)
         if args.text_weight != 0:
-            text_output = text_model(seq_price_x[:, -1, :], seq_text_x[:, -1, :])
+            text_output = text_model(seq_price_x[:, -1, :], seq_text_x)
             output = (1 - args.text_weight) * output + args.text_weight * text_output
 
         mse_loss = torch.mean((output - ground_truth) ** 2)
@@ -294,6 +299,9 @@ if __name__ == "__main__":
         hidden_size=args.text_hidden_size,
         pred_len=args.pred_len,
         num_layers=args.text_num_layers,
+        input_size=384,
+        gru_hidden_size=args.gru_hidden_size,
+        gru_num_layers=args.gru_num_layers,
     ).to(device)
 
     optimizer = torch.optim.Adam(
