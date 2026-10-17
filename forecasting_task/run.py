@@ -1,6 +1,8 @@
 import argparse
 import os
 import random
+import json
+import time
 
 import numpy as np
 import torch
@@ -100,6 +102,11 @@ def parse_args():
     args.d_layers = args.e_layers
     args.p_hidden_dims = [128,128]
     args.p_hidden_layers = 2
+    if os.path.isdir(args.logdir) and os.listdir(args.logdir):
+        raise FileExistsError(
+            f"Output directory is not empty: {args.logdir}. "
+            "Choose a new --logdir."
+    )
     os.makedirs(args.logdir, exist_ok=True)
     with open(os.path.join(args.logdir, "args.yaml"), "w") as f:
         yaml.safe_dump(vars(args), f, sort_keys=False)
@@ -161,6 +168,9 @@ def _inverse_transform_batch(dataset, tensor):
     inv = dataset.inverse_transform(flat)
     return inv.reshape(batch, length, channels)
 
+def synchronize_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 def _run_epoch(
     dataloader, dataset, model, text_model, args, device, optimizer=None, collect_io=False
@@ -221,6 +231,7 @@ def _run_epoch(
 
 
 if __name__ == "__main__":
+    run_started = time.perf_counter()
     args = parse_args()
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -307,8 +318,15 @@ if __name__ == "__main__":
     best_test_outputs = None
     patience_counter = 0
 
+    history = []
+    best_epoch = None
+    history_path = os.path.join(args.logdir, "history.jsonl")
+
     for epoch in range(1, args.num_epoch + 1):
-        train_mse, _ = _run_epoch(
+        synchronize_device(device)
+        started = time.perf_counter()
+
+        train_mse, train_mae = _run_epoch(
             train_dataloader,
             train_dataset,
             model,
@@ -317,8 +335,28 @@ if __name__ == "__main__":
             device,
             optimizer=optimizer,
         )
+
+        synchronize_device(device)
+        train_seconds = time.perf_counter() - started
+
         with torch.no_grad():
-            val_mse, _ = _run_epoch(val_dataloader, val_dataset, model, text_model, args, device)
+            synchronize_device(device)
+            started = time.perf_counter()
+
+            val_mse, val_mae = _run_epoch(
+                val_dataloader,
+                val_dataset,
+                model,
+                text_model,
+                args,
+                device,
+            )
+
+            synchronize_device(device)
+            val_seconds = time.perf_counter() - started
+
+            started = time.perf_counter()
+
             test_mse, test_mae, test_inputs, test_outputs, test_gts = _run_epoch(
                 test_dataloader,
                 test_dataset,
@@ -329,18 +367,68 @@ if __name__ == "__main__":
                 collect_io=True,
             )
 
+            synchronize_device(device)
+            test_seconds = time.perf_counter() - started
+
+        record = {
+            "epoch": epoch,
+            "train_mse": train_mse,
+            "train_mae": train_mae,
+            "val_mse": val_mse,
+            "val_mae": val_mae,
+            "test_mse": test_mse,
+            "test_mae": test_mae,
+            "train_seconds": train_seconds,
+            "val_seconds": val_seconds,
+            "test_seconds": test_seconds,
+        }
+        history.append(record)
+
+        with open(history_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, allow_nan=False) + "\n")
+
         print(
             f"[Epoch {epoch}] "
             f"train_mse={train_mse:.6f} "
             f"val_mse={val_mse:.6f} "
             f"test_mse={test_mse:.6f} "
-            f"test_mae={test_mae:.6f}"
+            f"test_mae={test_mae:.6f} "
+            f"train_s={train_seconds:.2f} "
+            f"val_s={val_seconds:.2f} "
+            f"test_s={test_seconds:.2f}"
         )
+        # print(
+        #     f"[Epoch {epoch}] "
+        #     f"train_mse={train_mse:.6f} "
+        #     f"val_mse={val_mse:.6f} "
+        #     f"test_mse={test_mse:.6f} "
+        #     f"test_mae={test_mae:.6f}"
+        # )
 
         if val_mse < best_val:
             best_val = val_mse
             best_test_mse = test_mse
             best_test_mae = test_mae
+            best_epoch = epoch
+
+            checkpoint = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "text_model_state_dict": text_model.state_dict(),
+                "args": vars(args).copy(),
+                "metrics": record.copy(),
+                "scaler_mean": train_dataset.scaler.mean_.tolist(),
+                "scaler_scale": train_dataset.scaler.scale_.tolist(),
+                "scaler_var": train_dataset.scaler.var_.tolist(),
+            }
+
+            checkpoint_path = os.path.join(
+                args.logdir, "best_checkpoint.pt"
+            )
+            temporary_path = checkpoint_path + ".tmp"
+
+            torch.save(checkpoint, temporary_path)
+            os.replace(temporary_path, checkpoint_path)
             patience_counter = 0
             best_test_inputs = test_inputs
             best_test_outputs = test_outputs
@@ -388,4 +476,42 @@ if __name__ == "__main__":
             },
             os.path.join(args.logdir, "test_io.pt"),
         )
-    
+    synchronize_device(device)
+    total_seconds = time.perf_counter() - run_started
+
+    summary = {
+        "model": args.model_type,
+        "data_path": args.data_path,
+        "seed": args.seed,
+        "text_weight": args.text_weight,
+        "used_col_prefixes": args.used_col_prefixes,
+        "epochs_completed": len(history),
+        "best_epoch": best_epoch,
+        "best_val_mse": best_val,
+        "best_test_mse": best_test_mse,
+        "best_test_mae": best_test_mae,
+        "train_seconds": sum(r["train_seconds"] for r in history),
+        "val_seconds": sum(r["val_seconds"] for r in history),
+        "test_seconds": sum(r["test_seconds"] for r in history),
+        "total_seconds": total_seconds,
+        "device": str(device),
+        "gpu_name": (
+            torch.cuda.get_device_name(device)
+            if device.type == "cuda"
+            else None
+        ),
+        "torch_version": str(torch.__version__),
+    }
+
+    if args.model_type.lower() == "patchtst":
+        summary["actual_patch_len"] = model.patch_embedding.patch_len
+        summary["actual_stride"] = model.patch_embedding.stride
+
+    with open(
+        os.path.join(args.logdir, "summary.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(summary, f, indent=2, allow_nan=False)
+
+    print(f"Total run time: {total_seconds:.2f} seconds")
