@@ -1,5 +1,4 @@
 import argparse
-from email import parser
 import os
 import random
 
