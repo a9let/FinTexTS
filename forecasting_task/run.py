@@ -123,11 +123,18 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 class TextModel(nn.Module):
-    def __init__(self, hidden_size, pred_len, num_layers):
+    def __init__(self, hidden_size, pred_len, num_layers, initial_text_weight=0.1):
         super(TextModel, self).__init__()
         self.relu = nn.ReLU()
         self.num_layers = num_layers
+        if not 0 < initial_text_weight < 1:
+            raise ValueError("initial_text_weight must be between 0 and 1")
 
+        self.alpha_logit = nn.Parameter(
+            torch.logit(
+                torch.tensor(initial_text_weight, dtype=torch.float32)
+            )
+        )
         if num_layers <= 1:
             self.layers = nn.ModuleList([nn.Linear(384, pred_len)])
         else:
@@ -136,7 +143,8 @@ class TextModel(nn.Module):
                 layers.append(nn.Linear(hidden_size, hidden_size))
             layers.append(nn.Linear(hidden_size, pred_len))
             self.layers = nn.ModuleList(layers)
-
+    def get_alpha(self):
+        return torch.sigmoid(self.alpha_logit)
     def forward(self, price_x, x):
         ori_x = x.clone()
         for i, layer in enumerate(self.layers):
@@ -199,10 +207,12 @@ def _run_epoch(
             optimizer.zero_grad()
 
         output = model(seq_price_x, seq_x_mark, dec_inp, seq_y_mark)
-        if args.text_weight != 0:
-            text_output = text_model(seq_price_x[:, -1, :], seq_text_x[:, -1, :])
-            output = (1 - args.text_weight) * output + args.text_weight * text_output
-
+        text_output = text_model(
+            seq_price_x[:, -1, :],
+            seq_text_x[:, -1, :],
+        )
+        alpha = text_model.get_alpha()
+        output = (1 - alpha) * output + alpha * text_output
         mse_loss = torch.mean((output - ground_truth) ** 2)
         mae_loss = torch.mean(torch.abs(output - ground_truth))
 
@@ -305,6 +315,7 @@ if __name__ == "__main__":
         hidden_size=args.text_hidden_size,
         pred_len=args.pred_len,
         num_layers=args.text_num_layers,
+        initial_text_weight=args.text_weight,
     ).to(device)
 
     optimizer = torch.optim.Adam(
@@ -312,6 +323,7 @@ if __name__ == "__main__":
     )
 
     best_val = float("inf")
+    best_text_alpha = None
     best_test_mse = float("inf")
     best_test_mae = float("inf")
     best_test_inputs = None
@@ -372,6 +384,7 @@ if __name__ == "__main__":
 
         record = {
             "epoch": epoch,
+            "text_alpha": text_model.get_alpha().detach().cpu().item(),
             "train_mse": train_mse,
             "train_mae": train_mae,
             "val_mse": val_mse,
@@ -393,6 +406,7 @@ if __name__ == "__main__":
             f"val_mse={val_mse:.6f} "
             f"test_mse={test_mse:.6f} "
             f"test_mae={test_mae:.6f} "
+            f"alpha={record['text_alpha']:.6f} "
             f"train_s={train_seconds:.2f} "
             f"val_s={val_seconds:.2f} "
             f"test_s={test_seconds:.2f}"
@@ -407,6 +421,7 @@ if __name__ == "__main__":
 
         if val_mse < best_val:
             best_val = val_mse
+            best_text_alpha = record["text_alpha"]
             best_test_mse = test_mse
             best_test_mae = test_mae
             best_epoch = epoch
@@ -483,7 +498,10 @@ if __name__ == "__main__":
         "model": args.model_type,
         "data_path": args.data_path,
         "seed": args.seed,
-        "text_weight": args.text_weight,
+        "text_weight_mode": "learnable",
+        "initial_text_weight": args.text_weight,
+        "best_text_alpha": best_text_alpha,
+        "final_text_alpha": text_model.get_alpha().detach().cpu().item(),
         "used_col_prefixes": args.used_col_prefixes,
         "epochs_completed": len(history),
         "best_epoch": best_epoch,
