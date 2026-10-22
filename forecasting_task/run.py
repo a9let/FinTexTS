@@ -69,6 +69,13 @@ def parse_args():
     parser.add_argument("--text_num_layers", type=int, default=1)
     parser.add_argument("--text_weight", type=float, default=0.1)
     
+    parser.add_argument(
+    "--initial_group_weights",
+    type=float,
+    nargs="+",
+    default=None,
+    help="Initial positive group weights in used_col_prefixes order.",)
+
     parser.add_argument("--activation", type=str, default="relu")
     parser.add_argument("--factor", type=int, default=1)
     parser.add_argument("--output_attention", type=bool, default=False)
@@ -96,6 +103,28 @@ def parse_args():
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args()
+
+    group_count = len(args.used_col_prefixes)
+
+    if group_count == 0:
+        parser.error("At least one text group is required.")
+
+    if args.initial_group_weights is None:
+        args.initial_group_weights = [1.0 / group_count] * group_count
+
+    weights = np.asarray(args.initial_group_weights, dtype=np.float64)
+
+    if weights.shape != (group_count,):
+        parser.error("Provide one initial weight for each text group.")
+
+    if not np.isfinite(weights).all() or (weights <= 0).any():
+        parser.error("Initial group weights must be finite and positive.")
+
+    if not np.isclose(weights.sum(), 1.0):
+        parser.error("Initial group weights must sum to 1.")
+
+    args.initial_group_weights = (weights / weights.sum()).tolist()
+
     args.enc_in = 4
     args.dec_in = 4
     args.c_out = 4
@@ -316,6 +345,23 @@ if __name__ == "__main__":
         used_col_prefixes=args.used_col_prefixes,
     ).to(device)
 
+    with torch.no_grad():
+        initial_weights = torch.tensor(
+        args.initial_group_weights,
+        dtype=text_model.G.dtype,
+        device=device,)
+
+        initial_logits = initial_weights.log()
+        initial_logits = initial_logits - initial_logits.mean()
+        text_model.G.copy_(initial_logits)
+
+    initial_group_weights = (
+    text_model.softmax(text_model.G).detach().cpu().tolist())
+
+    print(
+        "Initial group weights:",
+        dict(zip(args.used_col_prefixes, initial_group_weights)),)
+
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(text_model.parameters()), lr=args.lr
     )
@@ -381,6 +427,7 @@ if __name__ == "__main__":
 
         record = {
             "epoch": epoch,
+            "group_weights": (text_model.softmax(text_model.G).detach().cpu().tolist()),
             "train_mse": train_mse,
             "train_mae": train_mae,
             "val_mse": val_mse,
@@ -499,6 +546,9 @@ if __name__ == "__main__":
         "best_val_mse": best_val,
         "best_test_mse": best_test_mse,
         "best_test_mae": best_test_mae,
+        "initial_group_weights": initial_group_weights,
+        "best_group_weights": history[best_epoch - 1]["group_weights"],
+        "final_group_weights": history[-1]["group_weights"],
         "train_seconds": sum(r["train_seconds"] for r in history),
         "val_seconds": sum(r["val_seconds"] for r in history),
         "test_seconds": sum(r["test_seconds"] for r in history),
