@@ -6,8 +6,8 @@ import time
 
 import numpy as np
 import torch
-import torch.nn as nn
 import yaml
+from forecasting_task.models.GroupText import TextModel, TEXT_GROUPS, mlp_structure
 from forecasting_task.models.DLinear import Model as DLinear
 from forecasting_task.models.PatchTST import Model as PatchTST
 from forecasting_task.models.Informer import Model as Informer
@@ -32,7 +32,7 @@ def _parse_used_col_prefixes(value):
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="forecasting_task runner")
     parser.add_argument("--task_name", default="short_term_forecast")
     parser.add_argument("--seq_len", type=int, default=64)
@@ -43,13 +43,7 @@ def parse_args():
     parser.add_argument(
         "--used_col_prefixes",
         type=_parse_used_col_prefixes,
-        default=[
-            "macro",
-            "sector",
-            "targetCompany",
-            "relatedCompany",
-            "filing",
-        ],
+        default=list(TEXT_GROUPS),
         help="Comma-separated list, e.g. macro,sector,targetCompany,relatedCompany",
     )
     parser.add_argument("--seed", type=int, default=7)
@@ -68,6 +62,7 @@ def parse_args():
     parser.add_argument("--text_hidden_size", type=int, default=64)
     parser.add_argument("--text_num_layers", type=int, default=1)
     parser.add_argument("--text_weight", type=float, default=0.1)
+    parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
     
     parser.add_argument("--activation", type=str, default="relu")
     parser.add_argument("--factor", type=int, default=1)
@@ -95,7 +90,27 @@ def parse_args():
     parser.add_argument('--down_sampling_method', type=str, default=None,
                         help='down sampling method, only support avg, max, conv')
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if not 0 < args.text_weight < 1:
+        parser.error("--text_weight must satisfy 0 < text_weight < 1")
+    if args.text_num_layers < 1 or args.text_hidden_size < 1 or args.pred_len < 1:
+        parser.error("--text_num_layers, --text_hidden_size and --pred_len must be positive")
+    if (not args.used_col_prefixes or len(set(args.used_col_prefixes)) != len(args.used_col_prefixes)
+            or not set(args.used_col_prefixes).issubset(TEXT_GROUPS)):
+        parser.error("--used_col_prefixes must contain unique names from " + ",".join(TEXT_GROUPS))
+    if args.num_epoch < 1:
+        parser.error("--num_epoch must be positive")
+    args.text_model_config = {
+        "hidden_size": args.text_hidden_size,
+        "pred_len": args.pred_len,
+        "num_layers": args.text_num_layers,
+        "used_col_prefixes": list(args.used_col_prefixes),
+        "initial_text_weight": args.text_weight,
+        "fusion_mode": args.fusion_mode,
+    }
+    args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
+    args.initial_group_logits = [0.0] * len(args.used_col_prefixes)
+    args.initial_group_weights = {group: 1 / len(args.used_col_prefixes) for group in args.used_col_prefixes}
     args.enc_in = 4
     args.dec_in = 4
     args.c_out = 4
@@ -108,8 +123,6 @@ def parse_args():
             "Choose a new --logdir."
     )
     os.makedirs(args.logdir, exist_ok=True)
-    with open(os.path.join(args.logdir, "args.yaml"), "w") as f:
-        yaml.safe_dump(vars(args), f, sort_keys=False)
     
     return args
 
@@ -121,39 +134,6 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-class TextModel(nn.Module):
-    def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes):
-        super(TextModel, self).__init__()
-        self.relu = nn.ReLU()
-        self.num_layers = num_layers
-        self.used_col_prefixes = used_col_prefixes
-        self.softmax = nn.Softmax(dim=0)
-        self.G = nn.Parameter(torch.zeros(len(used_col_prefixes)))
-        if num_layers <= 1:
-            self.layers = nn.ModuleList([nn.Linear(384, pred_len)])
-        else:
-            layers = [nn.Linear(384, hidden_size)]
-            for _ in range(num_layers - 2):
-                layers.append(nn.Linear(hidden_size, hidden_size))
-            layers.append(nn.Linear(hidden_size, pred_len))
-            self.layers = nn.ModuleList(layers)
-        
-                
-    def forward(self, price_x, x):
-        ori_x = x.clone()
-        weights = self.softmax(self.G)
-        weights = weights.view(1, len(self.used_col_prefixes), 1)
-        x = x*weights
-        x =x.sum(dim = 1)
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if i < len(self.layers) - 1 :
-                x = self.relu(x)
-        
-        out = x.unsqueeze(-1).repeat(1, 1, price_x.shape[1]) + price_x.unsqueeze(1).repeat(1, x.shape[1], 1)
-        valid_mask = (ori_x.abs().sum(dim=[1, 2]) >= 1e-6).view(-1, 1, 1).float()
-        return out * valid_mask
 
 def _prepare_batch(batch, device, pred_len, label_len):
     seq_price_x, seq_price_y, seq_text_x, seq_x_mark, seq_y_mark, _ = batch
@@ -207,9 +187,7 @@ def _run_epoch(
             optimizer.zero_grad()
 
         output = model(seq_price_x, seq_x_mark, dec_inp, seq_y_mark)
-        if args.text_weight != 0:
-            text_output = text_model(seq_price_x[:, -1, :], seq_text_x[:, -1, :])
-            output = (1 - args.text_weight) * output + args.text_weight * text_output
+        output = text_model(output, seq_price_x[:, -1, :], seq_text_x[:, -1, :, :])
 
         mse_loss = torch.mean((output - ground_truth) ** 2)
         mae_loss = torch.mean(torch.abs(output - ground_truth))
@@ -238,9 +216,9 @@ def _run_epoch(
     return mse, mae
 
 
-if __name__ == "__main__":
+def main(argv=None):
     run_started = time.perf_counter()
-    args = parse_args()
+    args = parse_args(argv)
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_dataset, train_dataloader = get_dataset_dataloader(
@@ -309,18 +287,18 @@ if __name__ == "__main__":
         raise ValueError(f"Invalid model type: {args.model_type}")
     model = model.to(device)
     
-    text_model = TextModel(
-        hidden_size=args.text_hidden_size,
-        pred_len=args.pred_len,
-        num_layers=args.text_num_layers,
-        used_col_prefixes=args.used_col_prefixes,
-    ).to(device)
+    text_model = TextModel(**args.text_model_config).to(device)
+    # FiLM also records its fixed ratio on args during construction.
+    with open(os.path.join(args.logdir, "args.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump(vars(args), f, sort_keys=False)
 
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(text_model.parameters()), lr=args.lr
     )
 
     best_val = float("inf")
+    best_text_alpha = None
+    best_group_weights = None
     best_test_mse = float("inf")
     best_test_mae = float("inf")
     best_test_inputs = None
@@ -381,6 +359,7 @@ if __name__ == "__main__":
 
         record = {
             "epoch": epoch,
+            **text_model.fusion_state(),
             "train_mse": train_mse,
             "train_mae": train_mae,
             "val_mse": val_mse,
@@ -402,6 +381,7 @@ if __name__ == "__main__":
             f"val_mse={val_mse:.6f} "
             f"test_mse={test_mse:.6f} "
             f"test_mae={test_mae:.6f} "
+            f"alpha={record['text_alpha']:.6f} "
             f"train_s={train_seconds:.2f} "
             f"val_s={val_seconds:.2f} "
             f"test_s={test_seconds:.2f}"
@@ -416,6 +396,8 @@ if __name__ == "__main__":
 
         if val_mse < best_val:
             best_val = val_mse
+            best_text_alpha = record["text_alpha"]
+            best_group_weights = record["group_weights"].copy()
             best_test_mse = test_mse
             best_test_mae = test_mae
             best_epoch = epoch
@@ -424,6 +406,7 @@ if __name__ == "__main__":
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "text_model_state_dict": text_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
                 "args": vars(args).copy(),
                 "metrics": record.copy(),
                 "scaler_mean": train_dataset.scaler.mean_.tolist(),
@@ -487,12 +470,21 @@ if __name__ == "__main__":
         )
     synchronize_device(device)
     total_seconds = time.perf_counter() - run_started
+    final_fusion_state = text_model.fusion_state()
 
     summary = {
         "model": args.model_type,
         "data_path": args.data_path,
         "seed": args.seed,
-        "text_weight": args.text_weight,
+        "fusion_mode": args.fusion_mode,
+        "text_weight_mode": "learnable",
+        "initial_text_weight": args.text_weight,
+        "initial_group_weights": args.initial_group_weights,
+        "text_mlp_structure": args.text_mlp_structure,
+        "best_text_alpha": best_text_alpha,
+        "final_text_alpha": final_fusion_state["text_alpha"],
+        "best_group_weights": best_group_weights,
+        "final_group_weights": final_fusion_state["group_weights"],
         "used_col_prefixes": args.used_col_prefixes,
         "epochs_completed": len(history),
         "best_epoch": best_epoch,
@@ -524,3 +516,7 @@ if __name__ == "__main__":
         json.dump(summary, f, indent=2, allow_nan=False)
 
     print(f"Total run time: {total_seconds:.2f} seconds")
+
+
+if __name__ == "__main__":
+    main()
