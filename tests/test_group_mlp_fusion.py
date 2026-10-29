@@ -23,6 +23,13 @@ from forecasting_task.data_provider.dataset import Dataset_Custom
 from forecasting_task.models.GroupText import TextModel, TEXT_GROUPS
 
 
+INITIALIZATIONS = {
+    "uniform": [0.2, 0.2, 0.2, 0.2, 0.2],
+    "macro": [0.6, 0.1, 0.1, 0.1, 0.1],
+    "targetCompany": [0.1, 0.1, 0.6, 0.1, 0.1],
+}
+
+
 class GroupFusionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -177,11 +184,73 @@ class GroupFusionTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 run.parse_args([option, value])
 
+    def test_initial_weights_softmax_and_linear_heads(self):
+        for name, weights in INITIALIZATIONS.items():
+            with self.subTest(initialization=name), tempfile.TemporaryDirectory() as directory:
+                args = run.parse_args([
+                    "--text_num_layers", "1", "--pred_len", "3", "--text_hidden_size", "64",
+                    "--logdir", directory, "--initial_group_weights", *map(str, weights),
+                ])
+                model = TextModel(**args.text_model_config)
+                torch.testing.assert_close(model.get_group_weights(), torch.tensor(weights))
+                torch.testing.assert_close(model.G, torch.tensor(weights).log())
+                for head in model.group_mlps.values():
+                    self.assertEqual(len(head), 1)
+                    self.assertIsInstance(head[0], nn.Linear)
+                    self.assertEqual((head[0].in_features, head[0].out_features), (384, 3))
+        with tempfile.TemporaryDirectory() as directory:
+            args = run.parse_args(["--logdir", directory])
+            self.assertEqual(args.initial_group_weights, INITIALIZATIONS["uniform"])
+            model = TextModel(**args.text_model_config)
+            torch.testing.assert_close(model.get_group_weights(), torch.full((5,), 0.2))
+        # Validate against the selected group count, rather than hard-coding five.
+        with tempfile.TemporaryDirectory() as directory:
+            args = run.parse_args(["--logdir", directory, "--used_col_prefixes", "macro,filing",
+                                   "--initial_group_weights", "0.7", "0.3"])
+            torch.testing.assert_close(TextModel(**args.text_model_config).get_group_weights(),
+                                       torch.tensor([0.7, 0.3]))
+
+    def test_initial_weights_reject_invalid_values(self):
+        invalid = [[], [0.25] * 4, [1 / 6] * 6, [0, 0.25, 0.25, 0.25, 0.25],
+                   [-0.2, 0.3, 0.3, 0.3, 0.3], [0.1] * 5, [1e308] * 5,
+                   ["oops", 0.2, 0.2, 0.2, 0.2]]
+        invalid += [[value, 0.2, 0.2, 0.2, 0.2] for value in ("nan", "inf", "-inf")]
+        for weights in invalid:
+            with self.subTest(weights=weights), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    run.parse_args(["--initial_group_weights", *map(str, weights)])
+                with self.assertRaises(ValueError):
+                    TextModel(64, 3, 1, initial_group_weights=weights)
+        # Allow rounding noise, but do not silently accept materially unnormalized weights.
+        model = TextModel(64, 3, 1, initial_group_weights=[0.20000001] * 5)
+        torch.testing.assert_close(model.get_group_weights(), torch.full((5,), 0.2))
+
+    def test_initial_weights_do_not_change_film_heads_or_rng(self):
+        baseline_film = baseline_text = baseline_rng = None
+        for name, weights in [("default", None), *INITIALIZATIONS.items()]:
+            with self.subTest(initialization=name):
+                run.set_seed(7)
+                film = self.make_film()
+                text = TextModel(64, 3, 1, initial_group_weights=weights)
+                rng = torch.get_rng_state().clone()
+                film_state = film.state_dict()
+                text_state = {key: value for key, value in text.state_dict().items() if key != "G"}
+                if baseline_film is None:
+                    baseline_film, baseline_text, baseline_rng = film_state, text_state, rng
+                else:
+                    for key, value in film_state.items():
+                        torch.testing.assert_close(value, baseline_film[key], rtol=0, atol=0)
+                    for key, value in text_state.items():
+                        torch.testing.assert_close(value, baseline_text[key], rtol=0, atol=0)
+                    torch.testing.assert_close(rng, baseline_rng, rtol=0, atol=0)
+
     def test_runner_logging_best_checkpoint_early_stopping_and_eval_restore(self):
         # Two synthetic train batches, with controlled validation ordering so the
         # best checkpoint differs from the final state. No real dataset or GPU.
-        for mode in ("blend", "residual"):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+        configurations = [(mode, name, weights, layers) for mode in ("blend", "residual")
+                          for name, weights in INITIALIZATIONS.items() for layers in (1, 2)]
+        for mode, name, weights, layers in configurations:
+            with self.subTest(mode=mode, initialization=name, layers=layers), tempfile.TemporaryDirectory() as directory:
                 batch = (torch.randn(2, 12, 4), torch.randn(2, 5, 4),
                          torch.rand(2, 12, 5, 384), torch.zeros(2, 12, 3),
                          torch.zeros(2, 5, 3), torch.arange(2))
@@ -191,10 +260,13 @@ class GroupFusionTests(unittest.TestCase):
                 )
                 loaders = {flag: [batch] for flag in ("train", "val", "test")}
                 trained_states = []
+                initial_states = []
                 original_run_epoch = run._run_epoch
 
                 def epoch_wrapper(dataloader, dataset, film, text, args, device, optimizer=None, collect_io=False):
                     if optimizer is not None:
+                        if not initial_states:
+                            initial_states.append(text.fusion_state())
                         ids = [id(p) for group in optimizer.param_groups for p in group["params"]]
                         self.assertEqual(ids.count(id(text.alpha_logit)), 1)
                         self.assertEqual(len(ids), len(set(ids)))
@@ -209,9 +281,9 @@ class GroupFusionTests(unittest.TestCase):
                     return dataset, loaders[kwargs["flag"]]
 
                 argv = ["--model_type", "FiLM", "--seq_len", "12", "--label_len", "2",
-                        "--pred_len", "3", "--text_num_layers", "2", "--text_hidden_size", "8",
+                        "--pred_len", "3", "--text_num_layers", str(layers), "--text_hidden_size", "8",
                         "--num_epoch", "4", "--patience", "1", "--fusion_mode", mode,
-                        "--logdir", directory]
+                        "--logdir", directory, "--initial_group_weights", *map(str, weights)]
                 with patch.object(run, "get_dataset_dataloader", side_effect=loader_factory), \
                      patch.object(run, "_run_epoch", side_effect=epoch_wrapper), \
                      patch("torch.cuda.is_available", return_value=False), \
@@ -229,9 +301,14 @@ class GroupFusionTests(unittest.TestCase):
                 self.assertEqual(checkpoint["args"], args)
                 self.assertEqual(args["fusion_mode"], mode)
                 self.assertEqual(args["used_col_prefixes"], list(TEXT_GROUPS))
-                self.assertEqual(args["initial_group_logits"], [0.] * 5)
-                self.assertEqual(list(args["initial_group_weights"].values()), [0.2] * 5)
-                self.assertEqual([layer["type"] for layer in args["text_mlp_structure"]], ["Linear", "ReLU", "Linear"])
+                torch.testing.assert_close(torch.tensor(args["initial_group_logits"]), torch.tensor(weights).log())
+                actual_initial_weights = list(initial_states[0]["group_weights"].values())
+                self.assertEqual(args["initial_group_weights"], actual_initial_weights)
+                self.assertEqual(summary["initial_group_weights"], actual_initial_weights)
+                torch.testing.assert_close(torch.tensor(actual_initial_weights), torch.tensor(weights))
+                self.assertEqual(args["text_model_config"]["initial_group_weights"], weights)
+                expected_layers = ["Linear"] if layers == 1 else ["Linear", "ReLU", "Linear"]
+                self.assertEqual([layer["type"] for layer in args["text_mlp_structure"]], expected_layers)
                 self.assertEqual(args["text_model_config"]["initial_text_weight"], 0.1)
                 self.assertEqual(summary["best_text_alpha"], history[0]["text_alpha"])
                 self.assertEqual(summary["best_group_weights"], history[0]["group_weights"])
@@ -239,6 +316,7 @@ class GroupFusionTests(unittest.TestCase):
                 self.assertEqual(summary["final_group_weights"], history[-1]["group_weights"])
                 self.assertNotEqual(summary["best_text_alpha"], summary["final_text_alpha"])
                 self.assertNotEqual(summary["best_group_weights"], summary["final_group_weights"])
+                self.assertNotEqual(actual_initial_weights, list(summary["best_group_weights"].values()))
                 self.assertEqual(checkpoint["metrics"], history[0])
                 self.assertEqual(len(checkpoint["optimizer_state_dict"]["state"]),
                                  len(checkpoint["optimizer_state_dict"]["param_groups"][0]["params"]))

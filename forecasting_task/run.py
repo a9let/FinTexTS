@@ -7,7 +7,9 @@ import time
 import numpy as np
 import torch
 import yaml
-from forecasting_task.models.GroupText import TextModel, TEXT_GROUPS, mlp_structure
+from forecasting_task.models.GroupText import (
+    TextModel, TEXT_GROUPS, mlp_structure, validate_initial_group_weights,
+)
 from forecasting_task.models.DLinear import Model as DLinear
 from forecasting_task.models.PatchTST import Model as PatchTST
 from forecasting_task.models.Informer import Model as Informer
@@ -63,6 +65,10 @@ def parse_args(argv=None):
     parser.add_argument("--text_num_layers", type=int, default=1)
     parser.add_argument("--text_weight", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
+    parser.add_argument(
+        "--initial_group_weights", type=float, nargs="+", default=None,
+        help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
+    )
     
     parser.add_argument("--activation", type=str, default="relu")
     parser.add_argument("--factor", type=int, default=1)
@@ -100,6 +106,12 @@ def parse_args(argv=None):
         parser.error("--used_col_prefixes must contain unique names from " + ",".join(TEXT_GROUPS))
     if args.num_epoch < 1:
         parser.error("--num_epoch must be positive")
+    try:
+        args.initial_group_weights = validate_initial_group_weights(
+            args.initial_group_weights, len(args.used_col_prefixes)
+        )
+    except ValueError as error:
+        parser.error(str(error))
     args.text_model_config = {
         "hidden_size": args.text_hidden_size,
         "pred_len": args.pred_len,
@@ -107,10 +119,9 @@ def parse_args(argv=None):
         "used_col_prefixes": list(args.used_col_prefixes),
         "initial_text_weight": args.text_weight,
         "fusion_mode": args.fusion_mode,
+        "initial_group_weights": args.initial_group_weights.copy(),
     }
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
-    args.initial_group_logits = [0.0] * len(args.used_col_prefixes)
-    args.initial_group_weights = {group: 1 / len(args.used_col_prefixes) for group in args.used_col_prefixes}
     args.enc_in = 4
     args.dec_in = 4
     args.c_out = 4
@@ -288,6 +299,10 @@ def main(argv=None):
     model = model.to(device)
     
     text_model = TextModel(**args.text_model_config).to(device)
+    # Capture the effective softmax values before the optimizer can update G.
+    # Keep the requested initialization in text_model_config for reconstruction.
+    args.initial_group_weights = text_model.get_group_weights().detach().cpu().tolist()
+    args.initial_group_logits = text_model.G.detach().cpu().tolist()
     # FiLM also records its fixed ratio on args during construction.
     with open(os.path.join(args.logdir, "args.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(vars(args), f, sort_keys=False)

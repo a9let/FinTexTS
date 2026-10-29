@@ -1,11 +1,33 @@
 """Independent group MLPs and learnable price/text fusion."""
 
+import math
+
 import torch
 from torch import nn
 
 
 TEXT_GROUPS = ("macro", "sector", "targetCompany", "relatedCompany", "filing")
 EMBEDDING_SIZE = 384
+
+
+def validate_initial_group_weights(values, num_groups):
+    """Validate ordered CLI/model weights without consuming any random numbers."""
+    if values is None:
+        return [1.0 / num_groups] * num_groups
+    if len(values) != num_groups:
+        raise ValueError(f"initial_group_weights requires exactly {num_groups} values")
+    try:
+        weights = [float(value) for value in values]
+    except (TypeError, ValueError) as error:
+        raise ValueError("initial_group_weights must be numeric") from error
+    if any(not math.isfinite(value) or value <= 0 for value in weights):
+        raise ValueError("initial_group_weights must be finite and strictly positive")
+    # Bound individual values before summing, including very large finite inputs.
+    if any(value > 1 + 1e-6 for value in weights) or not math.isclose(
+        math.fsum(weights), 1.0, rel_tol=0.0, abs_tol=1e-6
+    ):
+        raise ValueError("initial_group_weights must sum to 1 (absolute tolerance 1e-6)")
+    return weights
 
 
 def mlp_structure(hidden_size, pred_len, num_layers):
@@ -23,7 +45,7 @@ def mlp_structure(hidden_size, pred_len, num_layers):
 
 class TextModel(nn.Module):
     def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
-                 initial_text_weight=0.1, fusion_mode="blend"):
+                 initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None):
         super().__init__()
         if not 0 < initial_text_weight < 1:
             raise ValueError("initial_text_weight must satisfy 0 < text_weight < 1")
@@ -34,6 +56,7 @@ class TextModel(nn.Module):
             raise ValueError("Text groups must be nonempty and unique")
         if not set(self.used_col_prefixes).issubset(TEXT_GROUPS):
             raise ValueError(f"Unknown text group; expected groups from {TEXT_GROUPS}")
+        initial_weights = validate_initial_group_weights(initial_group_weights, len(self.used_col_prefixes))
         self.fusion_mode = fusion_mode
         self.pred_len = pred_len
         structure = mlp_structure(hidden_size, pred_len, num_layers)
@@ -48,6 +71,9 @@ class TextModel(nn.Module):
             self.group_mlps[group] = nn.Sequential(*layers)
         self.G = nn.Parameter(torch.zeros(len(self.used_col_prefixes)))
         self.alpha_logit = nn.Parameter(torch.logit(torch.tensor(initial_text_weight, dtype=torch.float32)))
+        # Heads retain their original RNG initialization order. Only G changes.
+        with torch.no_grad():
+            self.G.copy_(torch.tensor(initial_weights, dtype=torch.float64).log())
 
     def get_alpha(self):
         return torch.sigmoid(self.alpha_logit)

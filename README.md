@@ -51,8 +51,14 @@ Each group has its own MLP. `--text_num_layers 1` uses `Linear(384, pred_len)`;
 larger values use `--text_hidden_size` hidden units and ReLU between linear layers.
 The dataset preserves group embeddings and fits the price scaler on training dates only.
 
-Group logits `G` start at zero, so `softmax(G)` initially assigns weight 0.2 to
-each group. A group is present when its original embedding has absolute sum
+Group logits `G` start at `log(initial_weights)`, so `softmax(G)` initially assigns
+the chosen group weights (uniform 0.2 per group by default). Set them with
+`--initial_group_weights 0.6 0.1 0.1 0.1 0.1`, in `--used_col_prefixes` order.
+The count must match the selected groups; values must be finite and strictly
+positive, and their sum must equal 1 within absolute tolerance `1e-6`.
+Initializing `G` consumes no random numbers and happens after head construction;
+the same seed therefore gives identical initial FiLM and head parameters across
+group initializations. A group is present when its original embedding has absolute sum
 at least `1e-6`. Its output is masked **after** the MLP; missing groups contribute
 zero without redistributing their weights. The weighted sum `delta` has one
 correction per forecast horizon, shared across all four OHLC channels.
@@ -94,6 +100,55 @@ validation checkpoint) from `final_text_alpha` / `final_group_weights` (the last
 completed epoch). Existing MSE/MAE, timing, chronological splits and early stopping
 are preserved.
 
+`initial_group_weights` in `args.yaml`, `summary.json` and checkpoint arguments
+is an ordered list of the actual initial softmax values, captured before the
+optimizer is created. `initial_group_logits` in the arguments records the actual
+starting logits. `text_model_config.initial_group_weights` retains the requested
+weights for reconstruction; tiny float32 rounding differences are expected.
+Initial values are separate from the named best/final group weight dictionaries.
+
+### Server experiment: 720 runs with linear heads
+
+Run `bash run_group_linear_init_720.sh` inside the existing CUDA-enabled Docker
+container. The script resolves the code directory from its own location and sets
+`PYTHONPATH` to include that directory and `forecasting_task`. No new dependencies
+are installed. Data and output directories are fixed in the script:
+
+```text
+DATA=/auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts
+RESULTS=/auto/datasets/kondyurin/FinTexTS/runs/group_linear_init_720_v1
+```
+
+Every model uses five independent `Linear(384, 3)` heads with no hidden layer.
+`text_hidden_size=64` is recorded but unused with `text_num_layers=1`.
+All configurations use FiLM, sequence length 64, label length 16, horizon 3,
+batch size 32, initial alpha 0.1, learning rate 0.001, up to 50 epochs and
+early stopping patience 10. Both OMP and MKL thread counts are set to 2.
+
+| Initialization | Weights: macro, sector, targetCompany, relatedCompany, filing | Tickers | Seeds | Fusion modes | Runs |
+| --- | --- | --- | --- | --- | --- |
+| uniform | 0.2 0.2 0.2 0.2 0.2 | All 100 | 7, 17, 27 | blend, residual | 600 |
+| macro | 0.6 0.1 0.1 0.1 0.1 | First 10 alphabetically | 7, 17, 27 | blend, residual | 60 |
+| targetCompany | 0.1 0.1 0.6 0.1 0.1 | Same first 10 | 7, 17, 27 | blend, residual | 60 |
+
+The script checks for exactly 100 parquet files and working CUDA before the
+queue. Sorting uses `LC_ALL=C`; the ten selected tickers are recorded in
+`RESULTS/selected_tickers.txt`. It also saves `code_commit.txt` and an exact copy
+of the script. If Git metadata cannot be read inside the container, pass the full
+code commit SHA through the environment, for example:
+
+```bash
+CODE_COMMIT=<full-commit-sha> bash run_group_linear_init_720.sh
+```
+
+Each run writes `train.log` beside its `output` directory under
+`RESULTS/full/{initialization}/{fusion_mode}/{ticker}/seed{seed}/`.
+Existing run directories are never overwritten; encountering one stops the queue.
+Existing experiment metadata must match and is preserved. A failed training
+process, or a missing/empty `summary.json` or `best_checkpoint.pt`, stops the queue
+and prints the last 30 training log lines. START/OK messages report
+`completed=N/720`; only a fully successful queue prints `ALL 720 RUNS COMPLETED`.
+
 Run synthetic checks without a dataset or GPU:
 
 ```powershell
@@ -103,3 +158,7 @@ python -m unittest discover -s tests -v
 These checks cover batch sizes 1 and greater, one/two/deeper MLPs, missing text,
 both fusion formulas, gradients and optimizer membership, train-only scaling,
 best/final logging, early stopping and exact eval prediction recovery from disk.
+They also check weight validation, the three starting distributions, single-layer
+head structure and independence of FiLM/head initialization from group weights.
+When Bash is available, the suite checks shell syntax and dispatches all 720
+configurations using fake training/CUDA, plus failure and overwrite guards.
