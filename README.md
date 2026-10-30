@@ -107,6 +107,104 @@ starting logits. `text_model_config.initial_group_weights` retains the requested
 weights for reconstruction; tiny float32 rounding differences are expected.
 Initial values are separate from the named best/final group weight dictionaries.
 
+### Linear heads without learned group weights
+
+Select `--group_weight_mode fixed_uniform --text_num_layers 1` for the new
+variant. The existing `learnable` mode remains available for previous experiments.
+The fixed variant requires all five groups in the order
+`macro, sector, targetCompany, relatedCompany, filing`. Each head is independently
+initialized as `Linear(384, pred_len)`, with no hidden layer or activation.
+`text_hidden_size` does not affect these heads. The fixed model has no `G`
+parameter or group softmax, including in its optimizer and checkpoint.
+
+Using only the last day of the text window, it computes:
+
+```text
+mask[g] = abs(embedding[g]).sum(-1) >= 1e-6
+delta = sum(mask[g] * head[g](embedding[g])) / 5
+alpha = sigmoid(alpha_logit)
+```
+
+The mask applies after each head, including its bias. Missing groups contribute
+zero; the denominator always remains five. Each horizon correction is shared
+by all four OHLC channels. Fusion is unchanged:
+
+- `blend`: `text_prediction = last_price + delta`, with the entire text prediction
+  set to zero when all groups are absent;
+  `output = (1-alpha)*price_output + alpha*text_prediction`.
+- `residual`: `output = price_output + alpha*delta`, exactly equal to the price
+  forecast when all groups are absent. Last price is not added.
+
+`--text_weight` initializes alpha and must be strictly between zero and one.
+Setting alpha and choosing the fusion mode consume no random numbers, so a given
+seed produces identical initial FiLM and head parameters for alpha starts
+0.01, 0.1 and 0.9 in both modes. FiLM, the heads and alpha train jointly with
+the existing Adam, validation checkpoint selection and early stopping. Scaling,
+chronological splits, metrics and timing remain unchanged.
+
+`--initial_group_weights` may be omitted or set to five uniform values; nonuniform
+values are explicitly rejected in this mode. Logs record
+`group_weight_mode: fixed_uniform` and `fixed_group_coefficients` (0.2 per group),
+without labeling these constants as learned best/final weights. Arguments,
+summary and checkpoint arguments retain the actual `initial_text_alpha`;
+`best_text_alpha` and `final_text_alpha` in the summary refer to the selected
+validation checkpoint and last epoch respectively. Epoch history records alpha.
+
+For restoration, call
+`build_text_model(checkpoint["args"]["text_model_config"], checkpoint["args"]["group_weight_mode"])`
+from `forecasting_task.models.GroupText`, then load `text_model_state_dict`.
+The FiLM parameters, Adam state and train scaler statistics are also saved.
+Older checkpoints without a mode use `learnable`.
+
+A checkpoint from the old one-layer model can be migrated while preserving
+predictions: for each group with old `w = softmax(G)[g]`, copy
+`W_new[g] = 5*w*W_old[g]`, `b_new[g] = 5*w*b_old[g]` and the same alpha logit.
+Drop `G` from the new state dictionary. This preserves the forward calculation
+with masking; it does not assert identical training trajectories from scratch.
+
+### Server experiment: 720 runs without learned group weights
+
+Run `bash run_group_no_weights_720.sh` in the existing CUDA-enabled Docker.
+The fixed-uniform server experiment uses
+`/auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts` for data and
+`/auto/datasets/kondyurin/FinTexTS/runs/group_no_weights_alpha_v1` for results.
+Its settings are FiLM, sequence length 64, label length 16, prediction length 3,
+batch size 32, `text_num_layers=1`, learning rate 0.001, at most 50 epochs and
+early stopping patience 10. Alpha labels and initial values are:
+
+| Label | Initial alpha | Tickers | Seeds | Fusion modes | Runs |
+| --- | --- | --- | --- | --- | --- |
+| alpha010 | 0.1 | All 100 | 7, 17, 27 | blend, residual | 600 |
+| alpha001 | 0.01 | First 10 alphabetically | 7, 17, 27 | blend, residual | 60 |
+| alpha090 | 0.9 | Same first 10 | 7, 17, 27 | blend, residual | 60 |
+
+These are exactly **720 unique configurations** with no additional seeds,
+tickers or repetitions. All three alpha starts are compared on the same first
+ten tickers with identical seeds and fusion modes. Sorting uses `LC_ALL=C`.
+
+Each run's output directory follows
+`RESULTS/full/{alpha_label}/{fusion_mode}/{ticker}/seed{seed}/output`, with
+`train.log` beside `output`. This layout keeps alpha starts and fusion modes
+separate while preserving each run's args, history, summary and best checkpoint.
+
+The script resolves CODE from its own location, sets `PYTHONPATH` to CODE and
+CODE/forecasting_task, and exports `OMP_NUM_THREADS=2` and `MKL_NUM_THREADS=2`.
+It checks for exactly 100 parquet files and working CUDA before starting training.
+It saves the selected ten tickers to `RESULTS/selected_tickers.txt`, the code SHA
+to `code_commit.txt`, and a copy of the running script. When Git metadata is not
+available inside the container, provide the full SHA without changing Git rights
+or configuration:
+
+```bash
+CODE_COMMIT=<full-commit-sha> bash run_group_no_weights_720.sh
+```
+
+An existing run directory stops the queue without overwriting its contents.
+An existing experiment metadata file must match. A failed training process or
+missing/empty `summary.json` or `best_checkpoint.pt` stops the queue and prints
+the last 30 lines of that run's `train.log`. START and OK report
+`completed=N/720`; completion is printed only as `ALL 720 RUNS COMPLETED`.
+
 ### Server experiment: 720 runs with linear heads
 
 Run `bash run_group_linear_init_720.sh` inside the existing CUDA-enabled Docker
@@ -161,4 +259,7 @@ best/final logging, early stopping and exact eval prediction recovery from disk.
 They also check weight validation, the three starting distributions, single-layer
 head structure and independence of FiLM/head initialization from group weights.
 When Bash is available, the suite checks shell syntax and dispatches all 720
-configurations using fake training/CUDA, plus failure and overwrite guards.
+configurations of each dispatcher using fake training/CUDA, plus failure and
+overwrite guards. Fixed-uniform tests additionally cover the absence of G,
+all alpha starts, initialization independence across fusion modes, old checkpoint
+migration and exact prediction recovery from disk.

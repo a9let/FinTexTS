@@ -9,6 +9,7 @@ import torch
 import yaml
 from forecasting_task.models.GroupText import (
     TextModel, TEXT_GROUPS, mlp_structure, validate_initial_group_weights,
+    validate_fixed_uniform_weights, build_text_model,
 )
 from forecasting_task.models.DLinear import Model as DLinear
 from forecasting_task.models.PatchTST import Model as PatchTST
@@ -65,6 +66,7 @@ def parse_args(argv=None):
     parser.add_argument("--text_num_layers", type=int, default=1)
     parser.add_argument("--text_weight", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
+    parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default="learnable")
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
         help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
@@ -110,6 +112,10 @@ def parse_args(argv=None):
         args.initial_group_weights = validate_initial_group_weights(
             args.initial_group_weights, len(args.used_col_prefixes)
         )
+        if args.group_weight_mode == "fixed_uniform":
+            if tuple(args.used_col_prefixes) != TEXT_GROUPS or args.text_num_layers != 1:
+                parser.error("fixed_uniform requires all five groups in order and --text_num_layers 1")
+            validate_fixed_uniform_weights(args.initial_group_weights, len(TEXT_GROUPS))
     except ValueError as error:
         parser.error(str(error))
     args.text_model_config = {
@@ -298,11 +304,14 @@ def main(argv=None):
         raise ValueError(f"Invalid model type: {args.model_type}")
     model = model.to(device)
     
-    text_model = TextModel(**args.text_model_config).to(device)
-    # Capture the effective softmax values before the optimizer can update G.
-    # Keep the requested initialization in text_model_config for reconstruction.
-    args.initial_group_weights = text_model.get_group_weights().detach().cpu().tolist()
-    args.initial_group_logits = text_model.G.detach().cpu().tolist()
+    text_model = build_text_model(args.text_model_config, args.group_weight_mode).to(device)
+    args.initial_text_alpha = text_model.get_alpha().detach().cpu().item()
+    if args.group_weight_mode == "learnable":
+        # Capture the effective softmax values before the optimizer can update G.
+        args.initial_group_weights = text_model.get_group_weights().detach().cpu().tolist()
+        args.initial_group_logits = text_model.G.detach().cpu().tolist()
+    else:
+        args.fixed_group_coefficients = text_model.fixed_group_coefficients()
     # FiLM also records its fixed ratio on args during construction.
     with open(os.path.join(args.logdir, "args.yaml"), "w", encoding="utf-8") as f:
         yaml.safe_dump(vars(args), f, sort_keys=False)
@@ -374,6 +383,7 @@ def main(argv=None):
 
         record = {
             "epoch": epoch,
+            "group_weight_mode": args.group_weight_mode,
             **text_model.fusion_state(),
             "train_mse": train_mse,
             "train_mae": train_mae,
@@ -412,13 +422,15 @@ def main(argv=None):
         if val_mse < best_val:
             best_val = val_mse
             best_text_alpha = record["text_alpha"]
-            best_group_weights = record["group_weights"].copy()
+            if args.group_weight_mode == "learnable":
+                best_group_weights = record["group_weights"].copy()
             best_test_mse = test_mse
             best_test_mae = test_mae
             best_epoch = epoch
 
             checkpoint = {
                 "epoch": epoch,
+                "group_weight_mode": args.group_weight_mode,
                 "model_state_dict": model.state_dict(),
                 "text_model_state_dict": text_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -492,14 +504,13 @@ def main(argv=None):
         "data_path": args.data_path,
         "seed": args.seed,
         "fusion_mode": args.fusion_mode,
+        "group_weight_mode": args.group_weight_mode,
         "text_weight_mode": "learnable",
         "initial_text_weight": args.text_weight,
-        "initial_group_weights": args.initial_group_weights,
+        "initial_text_alpha": args.initial_text_alpha,
         "text_mlp_structure": args.text_mlp_structure,
         "best_text_alpha": best_text_alpha,
         "final_text_alpha": final_fusion_state["text_alpha"],
-        "best_group_weights": best_group_weights,
-        "final_group_weights": final_fusion_state["group_weights"],
         "used_col_prefixes": args.used_col_prefixes,
         "epochs_completed": len(history),
         "best_epoch": best_epoch,
@@ -518,6 +529,13 @@ def main(argv=None):
         ),
         "torch_version": str(torch.__version__),
     }
+
+    if args.group_weight_mode == "learnable":
+        summary["initial_group_weights"] = args.initial_group_weights
+        summary["best_group_weights"] = best_group_weights
+        summary["final_group_weights"] = final_fusion_state["group_weights"]
+    else:
+        summary["fixed_group_coefficients"] = args.fixed_group_coefficients
 
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len
