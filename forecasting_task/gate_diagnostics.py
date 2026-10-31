@@ -43,6 +43,7 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
                     record = {"window_index": index, "input_end_date": date, "group": group,
                               "present": int(detail["present"][sample, group_index]),
                               "novelty": float(detail["novelty"][sample, group_index]),
+                              "novelty_used": float(detail["novelty_used"][sample, group_index]),
                               "pair_available": int(detail["pair_available"][sample, group_index]),
                               "weight": float(detail["weights"][sample, group_index])}
                     for horizon in range(args.pred_len):

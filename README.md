@@ -486,3 +486,68 @@ gaps, cross-split history, future independence, batch independence, base-scaler
 agreement, checkpoint/diagnostic reconstruction, and a mocked 2+60 queue with
 failure/overwrite checks and Bash syntax validation. No server data or GPU is
 needed for these checks.
+
+### Novelty ablation across all 100 tickers
+
+`--group_gate context_no_novelty` adds an ablation of the dynamic gate. Existing
+`static` and `context_novelty` behavior is preserved. Both dynamic conditions use
+the same zero-initialized `Linear(18,5)` gate (95 parameters):
+
+```text
+context_novelty:    concat(price_context_8, novelty_5, pair_available_5)
+context_no_novelty: concat(price_context_8, zeros_5,   pair_available_5)
+delta = sum_g(weight_g * present_g * head_g(embedding_g))
+prediction = 0.9 * FiLM_prediction + 0.1 * (last_price + delta)
+```
+
+Only gate input columns 8..12 are zeroed. The original embeddings, five linear
+heads, presence masks, price context and pair_available are unchanged. Causal
+novelty is still calculated from the same history for both conditions. Validation
+CSV diagnostics retain the real `novelty` and add `novelty_used`: real novelty for
+context_novelty, zero for context_no_novelty. Existing CSV/plot filenames, window
+ordering and best-checkpoint export are retained. The chosen condition is saved
+in args, history, summary, checkpoint and text_model_config, so the existing
+`build_text_model` reconstruction procedure restores the correct ablation.
+
+Both conditions train FiLM, heads and gate from scratch. Alpha stays fixed at 0.1;
+scaling, splits, metrics, early stopping and validation-MSE selection are unchanged.
+For one seed both conditions have identical FiLM/head initialization, initial
+predictions and train batch permutations. Seeds are used directly, without a
+condition-dependent offset.
+
+Inside the existing Docker, from the code checkout:
+
+```bash
+bash -n run_context_novelty_100.sh
+bash run_context_novelty_100.sh
+```
+
+Supply the full deployed code SHA through `CODE_COMMIT` if `.git` is unavailable.
+The dispatcher reads exactly 100 parquet files, sorted by filename with LC_ALL=C,
+checks ticker uniqueness (also rejecting case-only duplicates), and records all
+100 tickers in selected_tickers.txt. Data remain under
+`/auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts`.
+
+Two NVDA seed=7 one-epoch checks run first, followed by **600 new main runs**:
+100 tickers × seeds 7/17/27 × context_novelty/context_no_novelty. Main settings are
+FiLM, seq_len=64, label_len=16, pred_len=3, batch_size=32, num_epoch=50, patience=10,
+Adam lr=0.001, all five groups, text_num_layers=1 and fixed alpha=0.1.
+Results use the new root
+`/auto/datasets/kondyurin/FinTexTS/runs/context_novelty_100_v1`:
+
+```text
+checks/{condition}/NVDA/seed7/{train.log,output/}
+full/{condition}/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+The previous 10-ticker results are neither reused nor moved. The dispatcher
+preserves CUDA preflight, CODE/PYTHONPATH resolution, OMP/MKL threads=2, SHA and
+script-copy recording, destination overwrite guards, log tails on failure, and
+nonempty summary/checkpoint checks. START/OK progress excludes the two checks and
+ends at N/600 with `ALL 600 RUNS COMPLETED`.
+
+Synthetic checks verify that only novelty inputs are ablated, those five gate
+weight columns receive exactly zero gradients in the ablation and can receive
+nonzero gradients with novelty, initial states/predictions and batch order match,
+both checkpoints and diagnostics restore correctly, and the mocked dispatcher
+contains exactly 600 unique combinations plus two checks in the prescribed order.

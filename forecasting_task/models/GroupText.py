@@ -184,8 +184,8 @@ class ContextNoveltyTextModel(nn.Module):
                  initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
                  group_gate="static"):
         super().__init__()
-        if group_gate not in ("static", "context_novelty"):
-            raise ValueError("group_gate must be static or context_novelty")
+        if group_gate not in ("static", "context_novelty", "context_no_novelty"):
+            raise ValueError("group_gate must be static, context_novelty or context_no_novelty")
         if tuple(used_col_prefixes) != TEXT_GROUPS or num_layers != 1 or pred_len < 1:
             raise ValueError("group_gate requires five ordered groups and one linear layer")
         if initial_text_weight != 0.1 or fusion_mode != "blend":
@@ -197,7 +197,7 @@ class ContextNoveltyTextModel(nn.Module):
         })
         self.register_buffer("fixed_alpha", torch.tensor(0.1))
         self.gate = None
-        if group_gate == "context_novelty":
+        if group_gate != "static":
             # Linear's default initialization must not advance other RNG streams.
             with torch.random.fork_rng(devices=[]):
                 self.gate = nn.Linear(18, 5)
@@ -233,7 +233,8 @@ class ContextNoveltyTextModel(nn.Module):
             raise ValueError("Expected novelty and pair_available [batch,5]")
         context = torch.cat((price_window[:, -1] - price_window[:, -2],
                              price_window[:, -1] - price_window[:, -6]), dim=-1)
-        features = torch.cat((context, novelty, pair_available), dim=-1)
+        novelty_used = torch.zeros_like(novelty) if self.group_gate == "context_no_novelty" else novelty
+        features = torch.cat((context, novelty_used, pair_available), dim=-1)
         if self.gate is None:
             weights = embeddings.new_full((batch, 5), 0.2)
         else:
@@ -247,14 +248,14 @@ class ContextNoveltyTextModel(nn.Module):
         output = (1 - self.fixed_alpha) * price_output + self.fixed_alpha * (last_price.unsqueeze(1) + delta)
         if return_details:
             return output, {"weights": weights, "heads": heads, "present": present,
-                            "novelty": novelty, "pair_available": pair_available,
+                            "novelty": novelty, "novelty_used": novelty_used, "pair_available": pair_available,
                             "contributions": self.fixed_alpha * weighted, "features": features}
         return output
 
 
 def build_text_model(config, group_weight_mode="learnable"):
     if "group_gate" in config:
-        expected = "fixed_uniform" if config["group_gate"] == "static" else "context_novelty"
+        expected = "fixed_uniform" if config["group_gate"] == "static" else config["group_gate"]
         if group_weight_mode != expected:
             raise ValueError(f"group_gate={config['group_gate']} requires group_weight_mode={expected}")
         return ContextNoveltyTextModel(**config)
