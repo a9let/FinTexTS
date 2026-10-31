@@ -288,6 +288,73 @@ has lower MSE. A zero reference MSE gives an undefined percentage (blank CSV cel
 Existing diagnostic CSVs are preserved; move a previous report before rerunning.
 Original training outputs are never overwritten.
 
+### Persistence comparison across 100 tickers
+
+Inside the existing Docker, run:
+
+```bash
+python /workspace/FinTexTS/analyze_persistence_baseline.py --device cpu
+```
+
+The script uses the prepared parquet data and the six `full/alpha010` runs per
+ticker (blend/residual, seeds 7/17/27) under `group_no_weights_alpha_v1`.
+The historical comparison comes from
+`film_compare_50ep_v1/full/baseline/{ticker}/seed{seed}/output`.
+`--results_root`, `--baseline_root` and `--data_root` can relocate these inputs.
+No forecasting models or runner entry points are imported; model errors are
+read from summaries, preferring the available `best_val_mse`, `best_test_mse`,
+`best_test_mae` and `best_val_mae` fields (or explicitly named split-specific
+fields if best fields are absent). Missing metrics remain blank, and each
+reported model error records its actual source key.
+
+Exactly 100 distinct ticker parquet files and all 600 primary run configurations
+are required. Sequence/prediction/label lengths, four price channels, saved
+scalers, dataset preprocessing and declared split parameters are checked before
+pooling runs. The current `Dataset_Custom` fixed date policy is recorded explicitly:
+data from 2019-01-01 to 2023-12-19 exclusive, training before 2022-01-01,
+validation during 2022, and test during 2023 (with the data cutoff applied).
+Unknown saved split overrides are rejected rather than silently ignored.
+
+Persistence uses only `seq_price_x[:, -1:, :]`, expanded across `pred_len`;
+targets are the last `pred_len` entries of `seq_price_y`. Both val and test are
+replayed with `Dataset_Custom`, no shuffling, no dropped final batch, and no
+inverse transform. Error sums use all normalized OHLC elements. One val/test
+calculation per ticker is reused after the six configurations/scalers match,
+and seed/fusion independence of the resulting persistence scores is checked.
+No data-loader, forecasting model or training code is modified.
+
+For every primary run, normalized `inputs` and `ground_truths` from `test_io.pt`
+are checked against the complete ordered replayed test windows and targets.
+Saved-window persistence must agree too. Arrays ending in `_inv` are not used.
+Missing normalized arrays are reported with the file's actual keys; primary test
+improvements are withheld if saved-window verification is unavailable, and an
+actual primary window mismatch stops analysis. Historical baseline comparisons
+require matching configuration/scaler/split policy; saved windows are additionally
+checked when available. Missing historical saved windows are explicitly labeled,
+while configuration/scaler/window mismatches suppress relative improvements.
+Available raw historical summary errors remain visible with comparison status.
+
+Reports are written only after successful primary checks, to
+`group_no_weights_alpha_v1/diagnostics/persistence_100/`:
+
+- `per_run.csv`: persistence, both new variants and historical baseline, each
+  ticker/seed; raw errors, comparability, actual metric keys and test-file checks.
+- `per_ticker.csv`: three-seed means, confirmed improvements and stock-level wins.
+- `by_seed.csv`: means across all 100 stocks for each seed, with metric availability
+  and comparability counts. An incomplete cohort is never substituted for 100 stocks.
+- `across_seeds.csv`: mean and sample std (`ddof=1`) between three seed means.
+- `wins.csv`: stocks whose three-seed mean test MSE is strictly below persistence,
+  with the confirmed denominator and an explicit `all_100_confirmed` indicator.
+- `issues.csv`: missing fields/files and reasons for exclusion.
+- `configurations.csv`: replay settings, fixed split policy, scaler statistics,
+  element counts and hashes of the normalized val/test windows and targets.
+
+`improvement_pct = 100*(persistence_error-model_error)/persistence_error`;
+positive means the model is better. Zero-denominator percentages are blank.
+Overall improvements require all 100 comparable stocks for each seed. Missing
+validation MAE is never filled using test MAE. Original training artifacts and
+existing diagnostic CSVs are preserved.
+
 Run synthetic checks without a dataset or GPU:
 
 ```powershell
