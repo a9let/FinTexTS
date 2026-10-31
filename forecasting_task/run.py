@@ -3,6 +3,8 @@ import os
 import random
 import json
 import time
+import subprocess
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -64,9 +66,12 @@ def parse_args(argv=None):
     
     parser.add_argument("--text_hidden_size", type=int, default=64)
     parser.add_argument("--text_num_layers", type=int, default=1)
-    parser.add_argument("--text_weight", type=float, default=0.1)
+    parser.add_argument("--text_weight", type=float, default=None)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
-    parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default="learnable")
+    parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
+    parser.add_argument("--fixed_alpha_control", choices=["full", "anchor_only"], default=None,
+                        help="Separate anchored experiment with constant alpha=0.5")
+    parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
         help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
@@ -99,6 +104,28 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.text_weight is None:
+        args.text_weight = 0.5 if args.fixed_alpha_control else 0.1
+    if args.group_weight_mode is None:
+        args.group_weight_mode = "fixed_uniform" if args.fixed_alpha_control else "learnable"
+    if args.fixed_alpha_control:
+        if (args.model_type.lower() != "film" or args.text_weight != 0.5
+                or args.group_weight_mode != "fixed_uniform" or args.fusion_mode != "blend"):
+            parser.error("--fixed_alpha_control requires FiLM, text_weight=0.5, fixed_uniform and blend")
+        if not args.code_commit:
+            try:
+                args.code_commit = subprocess.check_output(
+                    ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "--verify", "HEAD"],
+                    text=True, stderr=subprocess.DEVNULL,
+                ).strip()
+            except (OSError, subprocess.CalledProcessError):
+                parser.error("Pass --code_commit or CODE_COMMIT when Git is unavailable")
+        if len(args.code_commit) not in (40, 64) or any(c not in "0123456789abcdefABCDEF" for c in args.code_commit):
+            parser.error("--code_commit must be a full hexadecimal Git SHA")
+        args.control_condition = args.fixed_alpha_control
+        args.fixed_alpha = 0.5
+        args.text_weight_mode = "fixed"
+        args.sampling_policy = "independent_train_generator"
     if not 0 < args.text_weight < 1:
         parser.error("--text_weight must satisfy 0 < text_weight < 1")
     if args.text_num_layers < 1 or args.text_hidden_size < 1 or args.pred_len < 1:
@@ -127,6 +154,8 @@ def parse_args(argv=None):
         "fusion_mode": args.fusion_mode,
         "initial_group_weights": args.initial_group_weights.copy(),
     }
+    if args.fixed_alpha_control:
+        args.text_model_config.update(control_condition=args.control_condition, fixed_alpha=args.fixed_alpha)
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
     args.enc_in = 4
     args.dec_in = 4
@@ -176,6 +205,14 @@ def _inverse_transform_batch(dataset, tensor):
 def synchronize_device(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _configure_control_sampling(dataloader, seed):
+    """Isolate train permutations from model construction and evaluation RNG use."""
+    generator = torch.Generator().manual_seed(seed)
+    dataloader.generator = generator
+    dataloader.sampler.generator = generator
+    return generator
 
 def _run_epoch(
     dataloader, dataset, model, text_model, args, device, optimizer=None, collect_io=False
@@ -268,6 +305,9 @@ def main(argv=None):
         root_path=args.root_path,
         batch_size=args.batch_size,
     )
+    train_generator = None
+    if args.fixed_alpha_control:
+        train_generator = _configure_control_sampling(train_dataloader, args.seed)
     if args.model_type.lower() == "dlinear":
         model = DLinear(args)
     elif args.model_type.lower() == "patchtst":
@@ -395,6 +435,8 @@ def main(argv=None):
             "val_seconds": val_seconds,
             "test_seconds": test_seconds,
         }
+        if args.fixed_alpha_control:
+            record["code_commit"] = args.code_commit
         history.append(record)
 
         with open(history_path, "a", encoding="utf-8") as f:
@@ -440,6 +482,12 @@ def main(argv=None):
                 "scaler_scale": train_dataset.scaler.scale_.tolist(),
                 "scaler_var": train_dataset.scaler.var_.tolist(),
             }
+            if args.fixed_alpha_control:
+                checkpoint.update(
+                    control_condition=args.control_condition, fixed_alpha=args.fixed_alpha,
+                    text_weight_mode="fixed", code_commit=args.code_commit,
+                    train_generator_state=train_generator.get_state(),
+                )
 
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
@@ -505,7 +553,7 @@ def main(argv=None):
         "seed": args.seed,
         "fusion_mode": args.fusion_mode,
         "group_weight_mode": args.group_weight_mode,
-        "text_weight_mode": "learnable",
+        "text_weight_mode": "fixed" if args.fixed_alpha_control else "learnable",
         "initial_text_weight": args.text_weight,
         "initial_text_alpha": args.initial_text_alpha,
         "text_mlp_structure": args.text_mlp_structure,
@@ -529,6 +577,10 @@ def main(argv=None):
         ),
         "torch_version": str(torch.__version__),
     }
+
+    if args.fixed_alpha_control:
+        summary.update(control_condition=args.control_condition, fixed_alpha=args.fixed_alpha,
+                       code_commit=args.code_commit, sampling_policy=args.sampling_policy)
 
     if args.group_weight_mode == "learnable":
         summary["initial_group_weights"] = args.initial_group_weights

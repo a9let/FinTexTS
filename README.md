@@ -371,3 +371,72 @@ configurations of each dispatcher using fake training/CUDA, plus failure and
 overwrite guards. Fixed-uniform tests additionally cover the absence of G,
 all alpha starts, initialization independence across fusion modes, old checkpoint
 migration and exact prediction recovery from disk.
+
+### Fixed alpha control: 60 runs
+
+The explicit `--fixed_alpha_control full|anchor_only` option selects a separate
+FiLM experiment with constant alpha=0.5. Existing blend/residual experiments
+retain their original behavior. Both controls train FiLM from scratch:
+
+```text
+delta = sum_g(mask_g * Linear_g(embedding_g)) / 5
+full        = 0.5 * FiLM_output + 0.5 * last_price + 0.5 * delta
+anchor_only = 0.5 * FiLM_output + 0.5 * last_price
+```
+
+The five independent heads are `Linear(384, pred_len)` in order macro, sector,
+targetCompany, relatedCompany, filing. Only the last text day is used. Masks
+`abs(embedding_g).sum(-1) >= 1e-6` apply after the heads; the denominator stays
+five. Delta is shared across OHLC channels. The last known normalized OHLC vector
+is repeated across the horizon and retained even when every group is absent.
+Alpha is a constant checkpoint buffer; there is no alpha logit or G.
+`anchor_only` constructs no text heads and optimizes only FiLM. Head creation
+preserves the CPU RNG state, and a separate seeded train-loader generator gives
+both conditions the same initial FiLM parameters and batch permutations.
+
+`run_fixed_alpha_control_60.sh` first runs NVDA seed 7 for one epoch per condition
+under `checks/`. It then dispatches exactly 60 full runs: AAPL, ABBV, ABT, ACN,
+ADBE, ADI, AMAT, AMD, AMGN, AMZN × seeds 7/17/27 × full/anchor_only. Settings:
+seq_len=64, label_len=16, pred_len=3, batch_size=32, text_num_layers=1,
+text_hidden_size=64 (unused), alpha=0.5, Adam lr=0.001, num_epoch=50, patience=10.
+The existing train-only scaler, temporal splits, normalized metrics, validation
+checkpoint selection, early stopping and timings are preserved.
+
+Inside the existing server Docker, from the code checkout:
+
+```bash
+bash -n run_fixed_alpha_control_60.sh
+bash run_fixed_alpha_control_60.sh
+```
+
+If Git metadata is not mounted, supply the deployed code SHA from the host:
+
+```bash
+CODE_COMMIT=<full_deployed_commit_sha> bash run_fixed_alpha_control_60.sh
+```
+
+The script resolves CODE from its own location, sets PYTHONPATH and OMP/MKL
+threads to two, requires CUDA and all eleven ticker parquet files under
+`/auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts`, and writes to
+`/auto/datasets/kondyurin/FinTexTS/runs/group_fixed_alpha050_v1`:
+
+```text
+code_commit.txt
+selected_tickers.txt
+run_fixed_alpha_control_60.sh
+checks/{condition}/NVDA/seed7/{train.log,output/}
+full/{condition}/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+Each output contains args.yaml, history.jsonl, best_checkpoint.pt, summary.json,
+test_io.pt and result.txt. Condition, fixed alpha, code SHA and timings are
+recorded; initial/best/final alpha are all 0.5. Checkpoints include both model
+states, optimizer, scaler, reconstruction configuration and train-generator state.
+Restore text fusion with `build_text_model(checkpoint['args']['text_model_config'],
+checkpoint['group_weight_mode'])`. Existing run directories are rejected before
+any training starts. Errors stop the queue and print the log tail; OK requires
+nonempty summary and checkpoint. The two checks do not count toward N/60.
+
+CPU synthetic coverage in `tests/test_fixed_alpha_control*.py` verifies formulas,
+missing text, fixed alpha/optimizer membership, gradients, matched initialization
+and batch order, exact checkpoint recovery, shell syntax, and a mocked 2+60 queue.

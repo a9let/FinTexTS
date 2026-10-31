@@ -177,7 +177,75 @@ class FixedUniformTextModel(nn.Module):
         return (1 - alpha) * price_output + alpha * text_prediction
 
 
+class FixedAlphaControlModel(nn.Module):
+    """Explicit anchored control; alpha is a constant buffer, never a parameter."""
+
+    def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
+                 initial_text_weight=0.5, fusion_mode="blend", initial_group_weights=None,
+                 control_condition="full", fixed_alpha=0.5):
+        super().__init__()
+        if control_condition not in ("full", "anchor_only"):
+            raise ValueError("control_condition must be full or anchor_only")
+        if fixed_alpha != 0.5 or initial_text_weight != 0.5 or fusion_mode != "blend":
+            raise ValueError("fixed alpha control requires alpha=0.5 and fusion_mode=blend")
+        if tuple(used_col_prefixes) != TEXT_GROUPS or num_layers != 1 or pred_len < 1:
+            raise ValueError("fixed alpha control requires five ordered groups and linear heads")
+        validate_fixed_uniform_weights(initial_group_weights, len(TEXT_GROUPS))
+        self.used_col_prefixes = TEXT_GROUPS
+        self.pred_len = pred_len
+        self.control_condition = control_condition
+        self.register_buffer("fixed_alpha", torch.tensor(0.5))
+        self.group_mlps = nn.ModuleDict()
+        # CPU head initialization must not perturb the stream used by FiLM or
+        # data loading. anchor_only has no text heads or text optimizer entries.
+        with torch.random.fork_rng(devices=[]):
+            if control_condition == "full":
+                self.group_mlps.update({
+                    group: nn.Sequential(nn.Linear(EMBEDDING_SIZE, pred_len))
+                    for group in TEXT_GROUPS
+                })
+
+    def get_alpha(self):
+        return self.fixed_alpha
+
+    def fixed_group_coefficients(self):
+        return {group: 1 / len(TEXT_GROUPS) for group in TEXT_GROUPS}
+
+    def fusion_state(self):
+        return {
+            "control_condition": self.control_condition,
+            "text_weight_mode": "fixed",
+            "fixed_alpha": self.fixed_alpha.item(),
+            "text_alpha": self.fixed_alpha.item(),
+            "group_weight_mode": "fixed_uniform",
+            "fixed_group_coefficients": self.fixed_group_coefficients(),
+        }
+
+    def forward(self, price_output, last_price, embeddings):
+        if embeddings.ndim != 3 or embeddings.shape[1:] != (len(TEXT_GROUPS), EMBEDDING_SIZE):
+            raise ValueError("Expected last-day text embeddings [batch, 5, 384]")
+        if (price_output.ndim != 3 or price_output.shape[:2] != (embeddings.shape[0], self.pred_len)
+                or last_price.shape != (embeddings.shape[0], price_output.shape[-1])):
+            raise ValueError("Expected price_output [batch, pred_len, channels] and last_price [batch, channels]")
+        output = (1 - self.fixed_alpha) * price_output + self.fixed_alpha * last_price.unsqueeze(1)
+        if self.control_condition == "anchor_only":
+            return output
+        present = embeddings.abs().sum(dim=-1) >= 1e-6
+        outputs = torch.stack([
+            self.group_mlps[group](embeddings[:, index])
+            for index, group in enumerate(TEXT_GROUPS)
+        ], dim=1)
+        delta = (outputs * present.unsqueeze(-1).to(outputs.dtype)).sum(dim=1) / len(TEXT_GROUPS)
+        delta = delta.unsqueeze(-1).expand_as(price_output)
+        # The price anchor remains present even when every text group is absent.
+        return output + self.fixed_alpha * delta
+
+
 def build_text_model(config, group_weight_mode="learnable"):
+    if "control_condition" in config:
+        if group_weight_mode != "fixed_uniform":
+            raise ValueError("fixed alpha control requires group_weight_mode=fixed_uniform")
+        return FixedAlphaControlModel(**config)
     if group_weight_mode == "fixed_uniform":
         return FixedUniformTextModel(**config)
     if group_weight_mode == "learnable":
