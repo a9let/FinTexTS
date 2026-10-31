@@ -247,6 +247,47 @@ process, or a missing/empty `summary.json` or `best_checkpoint.pt`, stops the qu
 and prints the last 30 training log lines. START/OK messages report
 `completed=N/720`; only a fully successful queue prints `ALL 720 RUNS COMPLETED`.
 
+### Validation price-anchor diagnostic
+
+Inside the existing Docker, run the independent diagnostic (CPU by default):
+
+```bash
+python /workspace/FinTexTS/analyze_blend_price_anchor.py --device cpu
+```
+
+The default results/data roots are the same as the fixed-uniform alpha experiment.
+`--results_root` and `--data_root` can relocate those inputs. The script first
+requires exactly 30 distinct best checkpoints under
+`full/alpha090/blend/{ticker}/seed{7,17,27}/output`, with the same ten tickers for
+all seeds. It checks the selected ticker list when present. It loads configuration
+and trained alpha from each best checkpoint, uses `Dataset_Custom(flag="val")`,
+and compares the dataset's train-fitted mean/scale/variance to the saved scaler.
+It does not call runner entry points or read saved prediction files.
+
+For the same validation batch it evaluates the trained `full` forward,
+`no_text_delta = (1-alpha)*film_output + alpha*last_price`, and persistence
+(`last_price` expanded across the horizon). The no-text-delta baseline retains
+last price even for absent text. All models run in eval under no-grad; MSE/MAE
+are accumulated over all normalized OHLC elements, including the last partial
+batch. No inverse transform is applied. Full MSE must reproduce the summary's
+`best_val_mse` with `rtol=1e-4, atol=1e-6`; a mismatch stops with the checkpoint
+path and both MSE values. No test-split evaluation or training is performed.
+
+After all 30 runs pass, CSVs are written only to
+`group_no_weights_alpha_v1/diagnostics/price_anchor/`:
+
+- `runs.csv`: per-run trained alpha, element count, all six errors and comparisons.
+- `by_seed.csv`: arithmetic means across ten tickers, percentage changes and win counts.
+- `across_seeds.csv`: means and sample standard deviations across three seed means
+  (`ddof=1`).
+- `comparisons.csv`: overall strict win counts out of 30 and percentage MSE changes
+  computed from the overall mean errors.
+
+Percentage change is `100*(full-reference)/reference`; negative values mean full
+has lower MSE. A zero reference MSE gives an undefined percentage (blank CSV cell).
+Existing diagnostic CSVs are preserved; move a previous report before rerunning.
+Original training outputs are never overwritten.
+
 Run synthetic checks without a dataset or GPU:
 
 ```powershell
