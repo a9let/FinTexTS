@@ -177,7 +177,87 @@ class FixedUniformTextModel(nn.Module):
         return (1 - alpha) * price_output + alpha * text_prediction
 
 
+class ContextNoveltyTextModel(nn.Module):
+    """Fixed-alpha anchored fusion with uniform or context-dependent group weights."""
+
+    def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
+                 initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
+                 group_gate="static"):
+        super().__init__()
+        if group_gate not in ("static", "context_novelty"):
+            raise ValueError("group_gate must be static or context_novelty")
+        if tuple(used_col_prefixes) != TEXT_GROUPS or num_layers != 1 or pred_len < 1:
+            raise ValueError("group_gate requires five ordered groups and one linear layer")
+        if initial_text_weight != 0.1 or fusion_mode != "blend":
+            raise ValueError("group_gate requires fixed alpha=0.1 and anchored blend")
+        validate_fixed_uniform_weights(initial_group_weights, 5)
+        self.used_col_prefixes, self.pred_len, self.group_gate = TEXT_GROUPS, pred_len, group_gate
+        self.group_mlps = nn.ModuleDict({
+            group: nn.Sequential(nn.Linear(EMBEDDING_SIZE, pred_len)) for group in TEXT_GROUPS
+        })
+        self.register_buffer("fixed_alpha", torch.tensor(0.1))
+        self.gate = None
+        if group_gate == "context_novelty":
+            # Linear's default initialization must not advance other RNG streams.
+            with torch.random.fork_rng(devices=[]):
+                self.gate = nn.Linear(18, 5)
+            nn.init.zeros_(self.gate.weight)
+            nn.init.zeros_(self.gate.bias)
+
+    def get_alpha(self):
+        return self.fixed_alpha
+
+    def fixed_group_coefficients(self):
+        if self.group_gate != "static":
+            raise ValueError("Dynamic weights are per-window, not fixed coefficients")
+        return dict.fromkeys(TEXT_GROUPS, 0.2)
+
+    def fusion_state(self):
+        state = {"group_gate": self.group_gate, "text_weight_mode": "fixed", "fixed_alpha": 0.1,
+                 "text_alpha": self.get_alpha().detach().cpu().item()}
+        if self.group_gate == "static":
+            state["fixed_group_coefficients"] = self.fixed_group_coefficients()
+        return state
+
+    def forward(self, price_output, last_price, embeddings, *, price_window, novelty,
+                pair_available, return_details=False):
+        batch = embeddings.shape[0]
+        if embeddings.ndim != 3 or embeddings.shape[1:] != (5, 384):
+            raise ValueError("Expected last-day embeddings [batch, 5, 384]")
+        if (price_output.ndim != 3 or price_output.shape != (batch, self.pred_len, 4)
+                or last_price.shape != (batch, 4)):
+            raise ValueError("Expected OHLC price output [batch,pred_len,4] and last_price [batch,4]")
+        if price_window.ndim != 3 or price_window.shape[0] != batch or price_window.shape[1] < 6 or price_window.shape[2] != 4:
+            raise ValueError("Price context requires at least six input OHLC rows")
+        if novelty.shape != (batch, 5) or pair_available.shape != (batch, 5):
+            raise ValueError("Expected novelty and pair_available [batch,5]")
+        context = torch.cat((price_window[:, -1] - price_window[:, -2],
+                             price_window[:, -1] - price_window[:, -6]), dim=-1)
+        features = torch.cat((context, novelty, pair_available), dim=-1)
+        if self.gate is None:
+            weights = embeddings.new_full((batch, 5), 0.2)
+        else:
+            weights = torch.softmax(self.gate(features), dim=-1)
+        present = embeddings.abs().sum(dim=-1) >= 1e-6
+        heads = torch.stack([self.group_mlps[group](embeddings[:, index])
+                             for index, group in enumerate(TEXT_GROUPS)], dim=1)
+        masked = heads * present.unsqueeze(-1).to(heads.dtype)
+        weighted = weights.unsqueeze(-1) * masked
+        delta = weighted.sum(dim=1).unsqueeze(-1).expand_as(price_output)
+        output = (1 - self.fixed_alpha) * price_output + self.fixed_alpha * (last_price.unsqueeze(1) + delta)
+        if return_details:
+            return output, {"weights": weights, "heads": heads, "present": present,
+                            "novelty": novelty, "pair_available": pair_available,
+                            "contributions": self.fixed_alpha * weighted, "features": features}
+        return output
+
+
 def build_text_model(config, group_weight_mode="learnable"):
+    if "group_gate" in config:
+        expected = "fixed_uniform" if config["group_gate"] == "static" else "context_novelty"
+        if group_weight_mode != expected:
+            raise ValueError(f"group_gate={config['group_gate']} requires group_weight_mode={expected}")
+        return ContextNoveltyTextModel(**config)
     if group_weight_mode == "fixed_uniform":
         return FixedUniformTextModel(**config)
     if group_weight_mode == "learnable":

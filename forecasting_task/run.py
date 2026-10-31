@@ -3,6 +3,8 @@ import os
 import random
 import json
 import time
+import subprocess
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -66,7 +68,10 @@ def parse_args(argv=None):
     parser.add_argument("--text_num_layers", type=int, default=1)
     parser.add_argument("--text_weight", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
-    parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default="learnable")
+    parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
+    parser.add_argument("--group_gate", choices=["static", "context_novelty"], default=None,
+                        help="Separate fixed-alpha=0.1 anchored group-gating experiment")
+    parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
         help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
@@ -99,6 +104,30 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.group_weight_mode is None:
+        args.group_weight_mode = "fixed_uniform" if args.group_gate else "learnable"
+    if args.group_gate:
+        if (args.model_type.lower() != "film" or args.text_weight != 0.1 or args.fusion_mode != "blend"
+                or args.group_weight_mode != "fixed_uniform" or args.seq_len < 6):
+            parser.error("--group_gate requires FiLM, alpha=0.1, blend, fixed_uniform and seq_len>=6")
+        if not args.code_commit:
+            try:
+                args.code_commit = subprocess.check_output(
+                    ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "--verify", "HEAD"],
+                    text=True, stderr=subprocess.DEVNULL,
+                ).strip()
+            except (OSError, subprocess.CalledProcessError):
+                parser.error("Pass --code_commit or CODE_COMMIT when Git is unavailable")
+        if len(args.code_commit) not in (40, 64) or any(c not in "0123456789abcdefABCDEF" for c in args.code_commit):
+            parser.error("--code_commit must be a full hexadecimal Git SHA")
+        from forecasting_task.data_provider.context_novelty import NOVELTY_POLICY
+        args.novelty_policy = NOVELTY_POLICY.copy()
+        args.fixed_alpha = 0.1
+        args.text_weight_mode = "fixed"
+        args.gate_structure = ({"type": "Linear", "in_features": 18, "out_features": 5,
+                                "parameters": 95, "initialization": "zeros"}
+                               if args.group_gate == "context_novelty" else None)
+        args.sampling_policy = "independent_train_generator"
     if not 0 < args.text_weight < 1:
         parser.error("--text_weight must satisfy 0 < text_weight < 1")
     if args.text_num_layers < 1 or args.text_hidden_size < 1 or args.pred_len < 1:
@@ -127,6 +156,10 @@ def parse_args(argv=None):
         "fusion_mode": args.fusion_mode,
         "initial_group_weights": args.initial_group_weights.copy(),
     }
+    if args.group_gate:
+        args.text_model_config["group_gate"] = args.group_gate
+        if args.group_gate == "context_novelty":
+            args.group_weight_mode = "context_novelty"
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
     args.enc_in = 4
     args.dec_in = 4
@@ -153,7 +186,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 def _prepare_batch(batch, device, pred_len, label_len):
-    seq_price_x, seq_price_y, seq_text_x, seq_x_mark, seq_y_mark, _ = batch
+    seq_price_x, seq_price_y, seq_text_x, seq_x_mark, seq_y_mark, _ = batch[:6]
     seq_price_x = seq_price_x.float().to(device)
     seq_price_y = seq_price_y.float().to(device)
     seq_text_x = seq_text_x.float().to(device)
@@ -176,6 +209,13 @@ def _inverse_transform_batch(dataset, tensor):
 def synchronize_device(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _configure_gate_sampling(loader, seed):
+    generator = torch.Generator().manual_seed(seed)
+    loader.generator = generator
+    loader.sampler.generator = generator
+    return generator
 
 def _run_epoch(
     dataloader, dataset, model, text_model, args, device, optimizer=None, collect_io=False
@@ -204,7 +244,11 @@ def _run_epoch(
             optimizer.zero_grad()
 
         output = model(seq_price_x, seq_x_mark, dec_inp, seq_y_mark)
-        output = text_model(output, seq_price_x[:, -1, :], seq_text_x[:, -1, :, :])
+        if getattr(args, "group_gate", None):
+            metadata = {key: value.float().to(device) for key, value in batch[6].items()}
+            output = text_model(output, seq_price_x[:, -1], seq_text_x[:, -1], price_window=seq_price_x, **metadata)
+        else:
+            output = text_model(output, seq_price_x[:, -1, :], seq_text_x[:, -1, :, :])
 
         mse_loss = torch.mean((output - ground_truth) ** 2)
         mae_loss = torch.mean(torch.abs(output - ground_truth))
@@ -238,7 +282,11 @@ def main(argv=None):
     args = parse_args(argv)
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_dataset, train_dataloader = get_dataset_dataloader(
+    loader_factory = get_dataset_dataloader
+    if args.group_gate:
+        from forecasting_task.data_provider.context_novelty import get_context_novelty_dataloader
+        loader_factory = get_context_novelty_dataloader
+    train_dataset, train_dataloader = loader_factory(
         seq_len=args.seq_len,
         label_len=args.label_len,
         pred_len=args.pred_len,
@@ -248,7 +296,7 @@ def main(argv=None):
         root_path=args.root_path,
         batch_size=args.batch_size,
     )
-    val_dataset, val_dataloader = get_dataset_dataloader(
+    val_dataset, val_dataloader = loader_factory(
         seq_len=args.seq_len,
         label_len=args.label_len,
         pred_len=args.pred_len,
@@ -258,7 +306,7 @@ def main(argv=None):
         root_path=args.root_path,
         batch_size=args.batch_size,
     )
-    test_dataset, test_dataloader = get_dataset_dataloader(
+    test_dataset, test_dataloader = loader_factory(
         seq_len=args.seq_len,
         label_len=args.label_len,
         pred_len=args.pred_len,
@@ -268,6 +316,7 @@ def main(argv=None):
         root_path=args.root_path,
         batch_size=args.batch_size,
     )
+    train_generator = _configure_gate_sampling(train_dataloader, args.seed) if args.group_gate else None
     if args.model_type.lower() == "dlinear":
         model = DLinear(args)
     elif args.model_type.lower() == "patchtst":
@@ -310,7 +359,7 @@ def main(argv=None):
         # Capture the effective softmax values before the optimizer can update G.
         args.initial_group_weights = text_model.get_group_weights().detach().cpu().tolist()
         args.initial_group_logits = text_model.G.detach().cpu().tolist()
-    else:
+    elif args.group_weight_mode == "fixed_uniform":
         args.fixed_group_coefficients = text_model.fixed_group_coefficients()
     # FiLM also records its fixed ratio on args during construction.
     with open(os.path.join(args.logdir, "args.yaml"), "w", encoding="utf-8") as f:
@@ -395,6 +444,8 @@ def main(argv=None):
             "val_seconds": val_seconds,
             "test_seconds": test_seconds,
         }
+        if args.group_gate:
+            record["code_commit"] = args.code_commit
         history.append(record)
 
         with open(history_path, "a", encoding="utf-8") as f:
@@ -440,6 +491,9 @@ def main(argv=None):
                 "scaler_scale": train_dataset.scaler.scale_.tolist(),
                 "scaler_var": train_dataset.scaler.var_.tolist(),
             }
+            if args.group_gate:
+                checkpoint.update(group_gate=args.group_gate, fixed_alpha=0.1, text_weight_mode="fixed",
+                                  code_commit=args.code_commit, train_generator_state=train_generator.get_state())
 
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
@@ -495,9 +549,24 @@ def main(argv=None):
             },
             os.path.join(args.logdir, "test_io.pt"),
         )
+    final_fusion_state = text_model.fusion_state()
+    gate_diagnostics = None
+    diagnostic_seconds = 0.0
+    if args.group_gate:
+        from forecasting_task.gate_diagnostics import write_gate_validation
+        synchronize_device(device)
+        diagnostic_started = time.perf_counter()
+        checkpoint = torch.load(os.path.join(args.logdir, "best_checkpoint.pt"), map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        text_model.load_state_dict(checkpoint["text_model_state_dict"])
+        # Keep the persisted reconstruction configuration immutable.
+        diagnostic_args = argparse.Namespace(**vars(args), diagnostic_best_val_mse=best_val)
+        gate_diagnostics = write_gate_validation(val_dataloader, val_dataset, model, text_model,
+                                                diagnostic_args, device, _prepare_batch)
+        synchronize_device(device)
+        diagnostic_seconds = time.perf_counter() - diagnostic_started
     synchronize_device(device)
     total_seconds = time.perf_counter() - run_started
-    final_fusion_state = text_model.fusion_state()
 
     summary = {
         "model": args.model_type,
@@ -505,7 +574,7 @@ def main(argv=None):
         "seed": args.seed,
         "fusion_mode": args.fusion_mode,
         "group_weight_mode": args.group_weight_mode,
-        "text_weight_mode": "learnable",
+        "text_weight_mode": "fixed" if args.group_gate else "learnable",
         "initial_text_weight": args.text_weight,
         "initial_text_alpha": args.initial_text_alpha,
         "text_mlp_structure": args.text_mlp_structure,
@@ -534,8 +603,14 @@ def main(argv=None):
         summary["initial_group_weights"] = args.initial_group_weights
         summary["best_group_weights"] = best_group_weights
         summary["final_group_weights"] = final_fusion_state["group_weights"]
-    else:
+    elif args.group_weight_mode == "fixed_uniform":
         summary["fixed_group_coefficients"] = args.fixed_group_coefficients
+
+    if args.group_gate:
+        summary.update(group_gate=args.group_gate, fixed_alpha=0.1, code_commit=args.code_commit,
+                       gate_structure=args.gate_structure, novelty_policy=args.novelty_policy,
+                       sampling_policy=args.sampling_policy, validation_diagnostics=gate_diagnostics,
+                       diagnostic_seconds=diagnostic_seconds)
 
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len

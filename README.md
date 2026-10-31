@@ -371,3 +371,118 @@ configurations of each dispatcher using fake training/CUDA, plus failure and
 overwrite guards. Fixed-uniform tests additionally cover the absence of G,
 all alpha starts, initialization independence across fusion modes, old checkpoint
 migration and exact prediction recovery from disk.
+
+### Context and novelty gate: 60 runs
+
+`--group_gate static|context_novelty` opts into a separate anchored FiLM experiment.
+The existing fusion modes retain their behavior. Both conditions use five
+independent `Linear(384, pred_len)` heads in order macro, sector, targetCompany,
+relatedCompany, filing, and **constant alpha=0.1** (a buffer, no alpha logit or G):
+
+```text
+d_g = Linear_g(last_input_day_embedding_g)
+mask_g = abs(embedding_g).sum(-1) >= 1e-6
+delta = sum_g(w_g * mask_g * d_g)
+prediction = 0.9 * FiLM_output + 0.1 * (last_price + delta)
+```
+
+The mask applies after each head, including its bias. The correction at each
+horizon is shared across the four normalized OHLC channels. Last price is the
+last known normalized input OHLC vector, repeated across the prediction horizon;
+it remains in the formula with completely missing text. Weights are never
+renormalized over present groups.
+
+`static` uses w=0.2 for every group. `context_novelty` forms 18 features:
+
+```text
+context = concat(X[-1] - X[-2], X[-1] - X[-6])  # 8 input OHLC features
+novelty_g = 1 - cosine(e_current_g, e_previous_present_g)
+features = concat(context, novelty_5, pair_available_5)
+weights = softmax(Linear(18, 5)(features), dim=-1)
+```
+
+The gate has exactly 95 parameters. Weight matrix and bias start at zero, giving
+identical initial weights (0.2) and predictions to static. Gate construction
+preserves the RNG state; each seed has identical initial FiLM/head parameters
+and a separate seeded train-loader generator ensures identical batch permutations.
+FiLM, heads and the dynamic gate train jointly with Adam, without new dropout or
+regularization. The optimizer includes each trainable parameter once.
+
+`data_provider/context_novelty.py` wraps `Dataset_Custom` only for this experiment.
+The base dataset, scaler and split implementation are unchanged. It computes
+novelty in chronological row order for one ticker at a time, using the previous
+strictly earlier **present** embedding of the same group, including available
+history before the current input window and across split boundaries. The current
+row is evaluated before updating its history; missing rows do not erase earlier
+text. If either embedding is unavailable, novelty and pair_available are zero.
+Cosine uses finite float64 normalized vectors, excludes zero norms and clips to
+[-1,1]. Embeddings and parquet files are not modified. Features are indexed by
+the actual last input row and do not depend on batching or shuffling.
+
+The wrapper verifies one ticker per file, unique chronological dates, and exact
+agreement with the base dataset's text/price slices. seq_len must be at least six.
+The existing daily row convention is preserved: these data do not identify the
+timing of intraday market reactions. Weights are allocation coefficients, not
+causal importance or a fraction of news already reflected in prices.
+
+After training, the best validation-MSE checkpoint is restored and validation
+runs in eval/no_grad. Its MSE is checked against the selected best value.
+`validation_group_diagnostics.csv` has five rows per window, in dataset window
+order followed by group order, with:
+
+- window index and actual date of the last input observation;
+- group, presence, novelty, pair_available and weight;
+- raw head outputs `head_h1..h3`;
+- actual normalized prediction corrections `contribution_h1..h3`, equal to
+  `0.1 * weight * mask * head` and shared across OHLC channels.
+
+`validation_weights.png` plots weights over time, and
+`validation_contributions_h1.png` through `h3.png` plot contributions separately
+for each horizon. This diagnostic uses validation only; test metrics never select
+the checkpoint. The normal args/history/summary/checkpoint/test_io artifacts and
+train/val/test timings remain, with separate `diagnostic_seconds` and total time
+including diagnostics. Configurations record fixed alpha, gate structure, novelty
+policy, group order and code SHA. Checkpoints include both model states, optimizer,
+train-only scaler statistics and train-generator state. Reconstruct text fusion
+with `build_text_model(checkpoint['args']['text_model_config'],
+checkpoint['group_weight_mode'])`, then load `text_model_state_dict`.
+
+Inside the existing server Docker, from the code checkout:
+
+```bash
+bash -n run_context_novelty_gate_60.sh
+bash run_context_novelty_gate_60.sh
+```
+
+If `.git` is unavailable, set `CODE_COMMIT` to the full deployed code SHA before
+running. The dispatcher resolves CODE from its own path, sets PYTHONPATH to include
+CODE and CODE/forecasting_task, and uses OMP/MKL threads=2. It checks CUDA and all
+eleven required parquet files in
+`/auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts`.
+
+It first runs NVDA seed=7 for one epoch per condition in `checks/`; these two
+runs are separate from the 60 main runs: AAPL, ABBV, ABT, ACN, ADBE, ADI, AMAT,
+AMD, AMGN, AMZN × seeds 7/17/27 × static/context_novelty. Main settings are FiLM,
+seq_len=64, label_len=16, pred_len=3, batch_size=32, text_num_layers=1,
+text_hidden_size=64 (unused), num_epoch=50, patience=10, lr=0.001, alpha=0.1.
+
+Results root is `/auto/datasets/kondyurin/FinTexTS/runs/context_novelty_gate_v1`:
+
+```text
+code_commit.txt
+selected_tickers.txt
+run_context_novelty_gate_60.sh
+checks/{condition}/NVDA/seed7/{train.log,output/}
+full/{condition}/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+Existing destinations are rejected before training. Errors stop the queue and
+print the log tail; OK requires nonempty summary.json and best_checkpoint.pt.
+Progress counts only the main runs, ending in `ALL 60 RUNS COMPLETED`.
+
+`tests/test_context_novelty*.py` covers the formulas, masks, exact zero-gate/static
+start, gradients, fixed alpha, initialization and batch permutations, first text,
+gaps, cross-split history, future independence, batch independence, base-scaler
+agreement, checkpoint/diagnostic reconstruction, and a mocked 2+60 queue with
+failure/overwrite checks and Bash syntax validation. No server data or GPU is
+needed for these checks.
