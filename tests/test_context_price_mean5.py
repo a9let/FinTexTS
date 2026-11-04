@@ -102,7 +102,7 @@ class Mean5Tests(unittest.TestCase):
     def test_seed_preserves_film_heads_rng_and_train_batch_order_between_pools(self):
         for seed in (7, 17, 27):
             reference = None
-            for pool in ("last", "mean5"):
+            for pool in ("last", "mean5", "redundancy5"):
                 run.set_seed(seed)
                 film = fixtures.ContextNoveltyTests.make_film()
                 text = ContextNoveltyTextModel(64, 3, 1, group_gate="context_price_only", text_temporal_pool=pool)

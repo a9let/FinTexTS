@@ -177,15 +177,26 @@ class FixedUniformTextModel(nn.Module):
         return (1 - alpha) * price_output + alpha * text_prediction
 
 
-def pool_text_window(embeddings, mode="last"):
+def validate_redundancy_tau(value):
+    try:
+        tau = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("redundancy_tau must be finite and strictly positive") from error
+    if not math.isfinite(tau) or tau <= 0:
+        raise ValueError("redundancy_tau must be finite and strictly positive")
+    return tau
+
+
+def pool_text_window(embeddings, mode="last", redundancy_tau=0.1, return_details=False):
     """Pool dataset rows per group; presence is determined BEFORE averaging."""
-    if mode not in ("last", "mean5"):
-        raise ValueError("text_temporal_pool must be last or mean5")
+    if mode not in ("last", "mean5", "redundancy5"):
+        raise ValueError("Unknown text_temporal_pool")
+    tau = validate_redundancy_tau(redundancy_tau)
     if embeddings.ndim == 3 and mode == "last":
         embeddings = embeddings.unsqueeze(1)
     if embeddings.ndim != 4 or embeddings.shape[2:] != (5, EMBEDDING_SIZE):
         raise ValueError("Expected text window [batch, rows, 5, 384]")
-    rows = 5 if mode == "mean5" else 1
+    rows = 1 if mode == "last" else 5
     if embeddings.shape[1] < rows:
         raise ValueError(f"{mode} requires at least {rows} input rows")
     window = embeddings[:, -rows:]
@@ -193,10 +204,37 @@ def pool_text_window(embeddings, mode="last"):
     counts = daily_present.sum(dim=1)
     if mode == "last":
         pooled = window[:, -1]
-    else:
+    elif mode == "mean5":
         masked = torch.where(daily_present.unsqueeze(-1), window, torch.zeros_like(window))
         pooled = masked.sum(dim=1) / counts.clamp_min(1).unsqueeze(-1).to(window.dtype)
-    return pooled, counts > 0, counts
+    else:
+        # Normalize copies only. Double precision keeps cosine calculations safe
+        # for very small/large finite float32 embedding norms and positive tau.
+        original = torch.where(daily_present.unsqueeze(-1), window, torch.zeros_like(window)).transpose(1, 2)
+        copies = original.double()
+        norms = torch.linalg.vector_norm(copies, dim=-1, keepdim=True)
+        unit = copies / norms.clamp_min(torch.finfo(copies.dtype).tiny)
+        cosine = (unit @ unit.transpose(-1, -2)).clamp(-1, 1)
+        diagonal = torch.eye(rows, dtype=torch.bool, device=window.device)
+        cosine = torch.where(diagonal, torch.ones_like(cosine), cosine)
+        present_rows = daily_present.transpose(1, 2)
+        valid_pairs = present_rows.unsqueeze(-1) & present_rows.unsqueeze(-2)
+        kernel = torch.exp(-(1 - cosine) / tau) * valid_pairs.to(copies.dtype)
+        density = kernel.sum(dim=-1)
+        inverse = torch.where(present_rows, density.clamp_min(1).reciprocal(), torch.zeros_like(density))
+        weights = inverse / inverse.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(copies.dtype).tiny)
+        pooled = (weights.to(original.dtype).unsqueeze(-1) * original).sum(dim=-2)
+    result = pooled, counts > 0, counts
+    if not return_details:
+        return result
+    if mode != "redundancy5":
+        weights = daily_present.transpose(1, 2).to(window.dtype) / counts.clamp_min(1).unsqueeze(-1)
+    effective = torch.where(counts > 0, weights.square().sum(dim=-1).clamp_min(torch.finfo(weights.dtype).tiny).reciprocal(), 0)
+    details = {"daily_present": daily_present, "temporal_weights": weights.transpose(1, 2),
+               "effective_dates": effective}
+    if mode == "redundancy5":
+        details["redundancy_density"] = density.transpose(1, 2)
+    return (*result, details)
 
 
 class ContextNoveltyTextModel(nn.Module):
@@ -204,7 +242,7 @@ class ContextNoveltyTextModel(nn.Module):
 
     def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
                  initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
-                 group_gate="static", text_temporal_pool="last"):
+                 group_gate="static", text_temporal_pool="last", redundancy_tau=0.1):
         super().__init__()
         if group_gate not in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
             raise ValueError("Unknown group_gate condition")
@@ -212,11 +250,12 @@ class ContextNoveltyTextModel(nn.Module):
             raise ValueError("group_gate requires five ordered groups and one linear layer")
         if initial_text_weight != 0.1 or fusion_mode != "blend":
             raise ValueError("group_gate requires fixed alpha=0.1 and anchored blend")
-        if text_temporal_pool not in ("last", "mean5") or (text_temporal_pool == "mean5" and group_gate != "context_price_only"):
-            raise ValueError("mean5 is supported only with context_price_only")
+        if text_temporal_pool not in ("last", "mean5", "redundancy5") or (text_temporal_pool != "last" and group_gate != "context_price_only"):
+            raise ValueError("Five-row pooling requires context_price_only")
         validate_fixed_uniform_weights(initial_group_weights, 5)
         self.used_col_prefixes, self.pred_len, self.group_gate = TEXT_GROUPS, pred_len, group_gate
         self.text_temporal_pool = text_temporal_pool
+        self.redundancy_tau = validate_redundancy_tau(redundancy_tau)
         self.group_mlps = nn.ModuleDict({
             group: nn.Sequential(nn.Linear(EMBEDDING_SIZE, pred_len)) for group in TEXT_GROUPS
         })
@@ -239,6 +278,7 @@ class ContextNoveltyTextModel(nn.Module):
 
     def fusion_state(self):
         state = {"group_gate": self.group_gate, "text_temporal_pool": self.text_temporal_pool,
+                 "redundancy_tau": self.redundancy_tau,
                  "text_weight_mode": "fixed", "fixed_alpha": 0.1,
                  "text_alpha": self.get_alpha().detach().cpu().item()}
         if self.group_gate == "static":
@@ -247,7 +287,8 @@ class ContextNoveltyTextModel(nn.Module):
 
     def forward(self, price_output, last_price, embeddings, *, price_window, novelty,
                 pair_available, return_details=False):
-        embeddings, present, available_count = pool_text_window(embeddings, self.text_temporal_pool)
+        pooling = pool_text_window(embeddings, self.text_temporal_pool, self.redundancy_tau, return_details)
+        embeddings, present, available_count = pooling[:3]
         batch = embeddings.shape[0]
         if embeddings.ndim != 3 or embeddings.shape[1:] != (5, 384):
             raise ValueError("Expected last-day embeddings [batch, 5, 384]")
@@ -275,6 +316,7 @@ class ContextNoveltyTextModel(nn.Module):
         output = (1 - self.fixed_alpha) * price_output + self.fixed_alpha * (last_price.unsqueeze(1) + delta)
         if return_details:
             return output, {"weights": weights, "heads": heads, "present": present,
+                            **pooling[3],
                             "available_count": available_count, "pooled_embeddings": embeddings,
                             "novelty": novelty, "novelty_used": novelty_used, "pair_available": pair_available,
                             "pair_available_used": pair_available_used,

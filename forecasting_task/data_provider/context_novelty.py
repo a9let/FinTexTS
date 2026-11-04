@@ -105,6 +105,11 @@ class ContextNoveltyDataset(Dataset):
         end = int(index) + self.seq_len - 1
         return str(self.row_dates[end - rows + 1]), str(self.row_dates[end])
 
+    def text_window_dates(self, index, rows):
+        self.text_window_bounds(index, rows)
+        end = int(index) + self.seq_len
+        return self.row_dates[end - rows:end].tolist()
+
     def inverse_transform(self, values):
         return self.base.inverse_transform(values)
 

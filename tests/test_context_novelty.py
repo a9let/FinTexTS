@@ -275,6 +275,7 @@ class ContextNoveltyTests(unittest.TestCase):
         frame = make_frame()
         cases = [(gate, "last") for gate in ("static", "context_novelty", "context_no_novelty", "context_price_only")]
         cases.append(("context_price_only", "mean5"))
+        cases.append(("context_price_only", "redundancy5"))
         for gate, pool in cases:
             with self.subTest(gate=gate, pool=pool), tempfile.TemporaryDirectory() as directory:
                 datasets = {flag: make_dataset(frame, flag) for flag in ("train", "val", "test")}
@@ -314,7 +315,10 @@ class ContextNoveltyTests(unittest.TestCase):
                 self.assertEqual(checkpoint["args"], args)
                 self.assertEqual(args["text_model_config"]["text_temporal_pool"], pool)
                 self.assertEqual(summary["text_temporal_pool"], pool)
-                if pool == "mean5":
+                self.assertEqual(args["redundancy_tau"], 0.1)
+                self.assertEqual(checkpoint["redundancy_tau"], 0.1)
+                self.assertEqual(summary["redundancy_tau"], 0.1)
+                if pool != "last":
                     self.assertEqual(summary["window_evidence"], args["window_evidence"])
                     self.assertTrue((root / "window_evidence.json").is_file())
                 self.assertEqual(checkpoint["epoch"], 1)
@@ -348,13 +352,29 @@ class ContextNoveltyTests(unittest.TestCase):
                 for row in rows:
                     index = int(row["window_index"])
                     group = TEXT_GROUPS.index(row["group"])
-                    width = 5 if pool == "mean5" else 1
+                    width = 1 if pool == "last" else 5
                     text_window = datasets["val"][index][2][-width:, group]
                     count = int((np.abs(text_window.astype(np.float32)).sum(-1) >= 1e-6).sum())
                     self.assertEqual(int(row["available_dates"]), count)
                     self.assertEqual(int(row["present"]), int(count > 0))
                     start, end = datasets["val"].text_window_bounds(index, width)
                     self.assertEqual((row["text_window_start_date"], row["text_window_end_date"]), (start, end))
+                    if pool == "redundancy5":
+                        daily = (np.abs(text_window.astype(np.float32)).sum(-1) >= 1e-6)
+                        a = np.array([float(row[f"temporal_weight_{day + 1}"]) for day in range(5)])
+                        densities = np.array([float(row[f"redundancy_r_{day + 1}"]) for day in range(5)])
+                        self.assertEqual([row[f"text_date_{day + 1}"] for day in range(5)],
+                                         datasets["val"].text_window_dates(index, 5))
+                        np.testing.assert_array_equal([int(row[f"daily_present_{day + 1}"]) for day in range(5)], daily)
+                        np.testing.assert_array_equal(a[~daily], 0)
+                        np.testing.assert_array_equal(densities[~daily], 0)
+                        if count:
+                            self.assertAlmostEqual(a.sum(), 1.)
+                            inverse = 1 / densities[daily]
+                            np.testing.assert_allclose(a[daily], inverse / inverse.sum())
+                            self.assertAlmostEqual(float(row["effective_dates"]), 1 / np.square(a).sum())
+                        else:
+                            self.assertEqual(row["effective_dates"], "")
                     expected_novelty = 0.0 if gate in ("context_no_novelty", "context_price_only") else float(row["novelty"])
                     self.assertEqual(float(row["novelty_used"]), expected_novelty)
                     expected_pair = 0 if gate == "context_price_only" else int(row["pair_available"])

@@ -734,5 +734,144 @@ using mean validation MSE; test scores and the two references do not select pool
 
 **Mandatory next stage:** compare mean5 with a repetition-aware aggregation of
 the **same five dataset rows**, holding the price-only gate, head architecture,
-alpha, split policy and training budget fixed. That second mechanism is not
-implemented in this experiment.
+alpha, split policy and training budget fixed. This follow-up is implemented below
+as redundancy5, while the mean5 experiment remains unchanged.
+
+### Inverse-redundancy pooling over the same five rows
+
+`--text_temporal_pool redundancy5 --redundancy_tau 0.1` compares a smooth
+inverse-density aggregation with ordinary mean5. Tau must be finite and strictly
+positive; the dispatcher fixes it at 0.1. Last and mean5 retain their numerical
+behavior. No trainable parameters, dropout or regularizers are added.
+
+For each group separately, take exactly the last five dataset rows of the input
+window. Define presence before aggregation by float32 L1 >= 1e-6, and let S be
+the present rows. For i,j in S:
+
+```text
+u_i = e_i / ||e_i||                         # copies for cosine only
+c_ij = clip(dot(u_i, u_j), -1, 1)
+K_ij = exp(-(1 - c_ij) / tau), K_ii = 1
+r_i = sum_j K_ij
+a_i = (1 / r_i) / sum_j(1 / r_j)
+aggregated = sum_i a_i * e_i                # ORIGINAL vectors and norms
+n_eff = 1 / sum_i(a_i ** 2)
+```
+
+Absent rows receive temporal weight zero and are excluded from both kernel axes.
+A single present row gets weight one. An empty group has a zero aggregate, zero
+weights and no presence; its diagnostic n_eff cell is blank. Presence stays
+`count > 0`, including cancellation of nonzero vectors. Cosine calculations use
+normalized float64 copies and explicit unit diagonals; the model receives the
+weighted original vectors. There is no threshold for declaring identical news,
+no forward/backward fill, no future rows and no history search outside the five
+input rows. Similarity between group embeddings is a **proxy for information
+repetition**, not an established match between events. n_eff describes temporal
+weight concentration, not a verified number of distinct events.
+
+```mermaid
+flowchart TD
+    T["Five input rows, separate text groups"] --> M["Daily float32 L1 presence masks"]
+    T --> U["Normalized copies for cosine only"]
+    U --> C["Clipped cosine matrix per group"]
+    C --> K["Smooth kernel K, diagonal 1; exclude absent pairs"]
+    M --> K
+    K --> R["Density r_i = sum_j K_ij"]
+    R --> A["Normalized inverse-density weights a_i"]
+    T --> E["Original embedding vectors with original norms"]
+    E --> V["Weighted temporal aggregate per group"]
+    A --> V
+    V --> H["Five independent Linear(384,3) heads"]
+    M --> N["Group present if any of the five rows is present"]
+    H --> D["Mask after heads; weighted sum across groups"]
+    N --> D
+    P["Known normalized OHLC input window"] --> F["FiLM prediction"]
+    P --> G["Price context 8 + zeros 10; Linear(18,5) + softmax"]
+    G --> D
+    P --> L["Last known OHLC"]
+    F --> O["0.9 FiLM + 0.1 last OHLC + 0.1 group correction"]
+    L --> O
+    D --> O
+```
+
+The context_price_only gate is unchanged: neither temporal masks, weights,
+densities nor counts enter it. novelty_used and pair_available_used remain zero.
+The gate still starts at zero logits, hence 0.2 per group; alpha is fixed at 0.1.
+FiLM, heads, optimizer, initialization order, train permutations, train-only scaler,
+temporal splits, loss/metrics, early stopping and best-val-MSE selection follow
+mean5. Checkpoint configuration includes both pooling and tau, including nondefault
+tau when requested directly; old configs default to tau=0.1 and their saved pool.
+
+Validation CSV and existing weight/contribution plots come from the selected best
+checkpoint. Redundancy rows additionally include text_date_1..5,
+daily_present_1..5, temporal_weight_1..5, redundancy_r_1..5, redundancy_tau and
+effective_dates. Absent-row r values are recorded as zero, and empty-group
+effective_dates is blank. The existing weight column is the group gate weight;
+temporal_weight columns are the within-group coefficients a_i. contribution_h1..h3
+remain signed normalized OHLC corrections `0.1 * weight * present * head`.
+window_evidence.json and its checkpoint/summary copies are saved as for mean5.
+
+Inside the existing Docker, from the checkout:
+
+```bash
+bash -n run_context_price_redundancy5_30.sh
+bash run_context_price_redundancy5_30.sh
+```
+
+The script first runs one NVDA seed7 check for one epoch, then 30 main runs on
+AAPL, ABBV, ABT, ACN, ADBE, ADI, AMAT, AMD, AMGN, AMZN × seeds 7/17/27. All use
+tau=0.1, FiLM, seq_len=64, label_len=16, pred_len=3, batch_size=32, five linear
+heads, Adam lr=0.001, max epochs=50 and patience=10. DATA remains the existing
+minilm_reproduction_v1/fintexts directory. The new results root is
+`/auto/datasets/kondyurin/FinTexTS/runs/context_price_redundancy5_10_v1`, with
+`checks/context_price_only/NVDA/seed7/output` and
+`full/context_price_only/{ticker}/seed{seed}/output`, plus adjacent train.log files.
+CUDA/overwrite/artifact guards, failure tails, code SHA, script copy, CODE_COMMIT
+fallback and N/30 progress are retained; existing results are neither reused nor
+overwritten.
+
+After training:
+
+```bash
+python analyze_context_price_redundancy5.py
+```
+
+The primary pair is redundancy5 versus saved mean5 from context_price_mean5_10_v1.
+Last from context_price_only_10_v1 and original baseline from film_compare_50ep_v1
+are extra references. The script compares identical ten-stock/three-seed cohorts,
+saved configurations/scalers and replayed target windows. Default tau=0.1 is
+required for the new controlled experiment. Reports go to the new root's
+diagnostics/comparison_10; overrides are --results_root, --mean5_root, --last_root,
+--baseline_root, --data_root and --output_dir. Source runs are read only and an
+existing report directory is rejected.
+
+The usual per_run/per_ticker, by_seed/across_seeds, paired_by_ticker, wins,
+relative_by_seed, target_windows, issues and selection.json reports are saved.
+Validation MSE and test MSE/MAE use seed means across ten stocks, then mean/sample
+std between three seed means (ddof=1). Stock wins use three-seed averages first.
+Negative left-minus-right/relative change means lower error for the left variant.
+Only redundancy5/mean5 validation MSE selects pooling; test errors and references
+cannot select the primary winner.
+
+Window verification is explicitly printed and saved in window_verification.csv
+and window_verification_summary.csv:
+
+- full: saved val/test input/target/date fingerprints, normalized saved test arrays
+  and validation diagnostic date/order checks all agree with the replay;
+- partial: available evidence agrees, but historical fingerprints or saved arrays/
+  dates are absent. Replayed validation targets are **not** claimed to confirm
+  historical target values. Legacy last/baseline often fall in this category;
+- mismatch: actual fingerprints, saved normalized arrays or dates contradict the
+  replay. The failing checks and paths appear in issues and per-run details;
+- not_checked: earlier metadata/configuration/scaler checks failed, so no claim
+  about window equality is made.
+
+Each status has separate Boolean evidence flags and counts per variant. The
+primary pools require full evidence; partial primary evidence or any primary
+incompatibility saves the diagnostic report, blocks selection and makes the CLI
+exit unsuccessfully. Compatible partial legacy references are labeled as partial;
+they are never upgraded to full verification. Missing metrics remain blank.
+Tests cover the exact kernel/weight formulas, gaps/empty/single rows, identical
+and orthogonal vectors, date permutations, group isolation, original norms,
+unchanged initialization/batching, checkpoint/tau/diagnostic recovery, the mocked
+1+30 queue, report statistics and all verification statuses.

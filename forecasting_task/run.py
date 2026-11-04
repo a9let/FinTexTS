@@ -11,7 +11,7 @@ import torch
 import yaml
 from forecasting_task.models.GroupText import (
     TextModel, TEXT_GROUPS, mlp_structure, validate_initial_group_weights,
-    validate_fixed_uniform_weights, build_text_model,
+    validate_fixed_uniform_weights, build_text_model, validate_redundancy_tau,
 )
 from forecasting_task.models.DLinear import Model as DLinear
 from forecasting_task.models.PatchTST import Model as PatchTST
@@ -66,7 +66,8 @@ def parse_args(argv=None):
     
     parser.add_argument("--text_hidden_size", type=int, default=64)
     parser.add_argument("--text_num_layers", type=int, default=1)
-    parser.add_argument("--text_temporal_pool", choices=["last", "mean5"], default="last")
+    parser.add_argument("--text_temporal_pool", choices=["last", "mean5", "redundancy5"], default="last")
+    parser.add_argument("--redundancy_tau", type=float, default=0.1)
     parser.add_argument("--text_weight", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
@@ -105,9 +106,13 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
-    if args.text_temporal_pool == "mean5":
+    try:
+        args.redundancy_tau = validate_redundancy_tau(args.redundancy_tau)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.text_temporal_pool != "last":
         if args.group_gate != "context_price_only" or args.seq_len < 5 or "fnspid" in args.data_path:
-            parser.error("mean5 requires context_price_only, seq_len>=5 and data without forward fill")
+            parser.error("Five-row pooling requires context_price_only, seq_len>=5 and data without forward fill")
     if args.group_weight_mode is None:
         args.group_weight_mode = "fixed_uniform" if args.group_gate else "learnable"
     if args.group_gate:
@@ -163,6 +168,7 @@ def parse_args(argv=None):
     if args.group_gate:
         args.text_model_config["group_gate"] = args.group_gate
         args.text_model_config["text_temporal_pool"] = args.text_temporal_pool
+        args.text_model_config["redundancy_tau"] = args.redundancy_tau
         if args.group_gate != "static":
             args.group_weight_mode = args.group_gate
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
@@ -322,7 +328,7 @@ def main(argv=None):
         batch_size=args.batch_size,
     )
     train_generator = _configure_gate_sampling(train_dataloader, args.seed) if args.group_gate else None
-    if args.text_temporal_pool == "mean5":
+    if args.text_temporal_pool != "last":
         from forecasting_task.window_evidence import window_evidence
         args.window_evidence = {"val": window_evidence(val_dataset), "test": window_evidence(test_dataset)}
         with open(os.path.join(args.logdir, "window_evidence.json"), "x", encoding="utf-8") as handle:
@@ -503,6 +509,7 @@ def main(argv=None):
             }
             if args.group_gate:
                 checkpoint.update(group_gate=args.group_gate, text_temporal_pool=args.text_temporal_pool,
+                                  redundancy_tau=args.redundancy_tau,
                                   fixed_alpha=0.1, text_weight_mode="fixed",
                                   code_commit=args.code_commit, train_generator_state=train_generator.get_state())
 
@@ -590,6 +597,7 @@ def main(argv=None):
         "initial_text_alpha": args.initial_text_alpha,
         "text_mlp_structure": args.text_mlp_structure,
         "text_temporal_pool": args.text_temporal_pool,
+        "redundancy_tau": args.redundancy_tau,
         "best_text_alpha": best_text_alpha,
         "final_text_alpha": final_fusion_state["text_alpha"],
         "used_col_prefixes": args.used_col_prefixes,
@@ -623,7 +631,7 @@ def main(argv=None):
                        gate_structure=args.gate_structure, novelty_policy=args.novelty_policy,
                        sampling_policy=args.sampling_policy, validation_diagnostics=gate_diagnostics,
                        diagnostic_seconds=diagnostic_seconds)
-    if args.text_temporal_pool == "mean5":
+    if args.text_temporal_pool != "last":
         summary["window_evidence"] = args.window_evidence
 
     if args.model_type.lower() == "patchtst":
