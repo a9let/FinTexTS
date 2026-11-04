@@ -875,3 +875,85 @@ Tests cover the exact kernel/weight formulas, gaps/empty/single rows, identical
 and orthogonal vectors, date permutations, group isolation, original norms,
 unchanged initialization/batching, checkpoint/tau/diagnostic recovery, the mocked
 1+30 queue, report statistics and all verification statuses.
+
+### How strongly does redundancy5 change the aggregate?
+
+Run the validation-only strength diagnostic inside the existing Docker:
+
+```bash
+python analyze_redundancy5_strength.py
+```
+
+Defaults are the same redundancy5 results root and minilm_reproduction_v1/fintexts
+data root. `--results_root`, `--data_root`, `--output_dir`, and `--top_k` relocate
+inputs/reports or change the number of examples. There is no tau override or
+search: tau comes from the saved experiment configuration. CPU is used; no model,
+optimizer or training entry point is constructed, and no test_io or test split is
+evaluated. The model, runner and original training outputs are not changed.
+
+Exactly 30 distinct completed runs are required: the same ten stocks × seeds
+7/17/27, under full/context_price_only (checks are excluded). Each must have a
+nonempty summary, best checkpoint and validation_group_diagnostics.csv. The script
+checks condition/pooling/tau, group and head/gate settings, temporal split policy,
+scalers, completion/best-epoch metadata and saved validation fingerprints when
+available. It replays Dataset_Custom validation input windows and verifies the
+CSV's window/group order and actual dates. Saved daily masks, weights, r_i, counts
+and effective_dates are checked whenever present; absent optional fields are
+reconstructed and listed explicitly. A disagreement stops before writing reports.
+
+For every group/window it evaluates mean5 and redundancy5 on the **same five
+original vectors**. It never compares the heads or predictions of different
+trained models. Group gate weights and saved head outputs do not enter these
+measurements. Distances therefore describe an embedding-aggregation change, not
+an OHLC prediction change.
+
+Quantiles (min, 1/5/10/25/50/75/90/95/99 percentiles and max) are grouped by text
+group and N, the number of present dates:
+
+- pair_cosines and offdiag_kernel use unordered present pairs i<j, excluding the
+  diagonal. N=1 has no pair samples;
+- r_present includes only present dates; density includes K_ii=1;
+- weight_l1_deviation is sum over present dates of abs(a_i-1/N);
+- effective_dates is 1/sum(a_i²), and effective_dates_ratio divides it by N;
+- aggregate_l2 and aggregate_l1 measure redundancy5-minus-mean5 using the actual
+  CPU float32 pool outputs and float64 distance calculations. Original embedding
+  norms are retained;
+- aggregate_relative_l2 divides L2 by the mean5 aggregate norm, and
+  aggregate_cosine_distance compares aggregate directions. Undefined zero-norm
+  cases remain blank, rather than being replaced by a small denominator.
+
+Empty group windows are counted separately and excluded from scalar distributions;
+their effective-date and aggregate-distance fields are blank. Fully empty text
+windows across all five groups are also counted separately. Tiny aggregate changes
+can include float32 arithmetic rounding; no threshold is used to suppress them.
+For N<=2, the symmetric kernel yields uniform temporal weights mathematically.
+
+Reports are saved to the redundancy5 results root's diagnostics/redundancy5_strength:
+
+- quantiles.csv: distributions over all 30 saved runs;
+- quantiles_unique.csv: distributions over unique ticker/window/group observations;
+- counts.csv: N=0..5 counts and fractions, in both unique-window and run units;
+- per_window.csv: unique windows, five dates, masks, a_i, r_i, original norms,
+  pair cosine/kernel lists and scalar strength metrics;
+- empty_windows.csv and fully_empty_windows.csv: empty groups and wholly empty
+  input text windows;
+- top_examples.csv: largest L2 aggregate changes globally;
+- top_examples_by_group_N.csv: largest changes separately by group and N;
+- verification.csv: all 30 source runs, checked/reconstructed fields, CSV hashes,
+  validation evidence and reconstructed text fingerprints;
+- manifest.json: sample definitions, units, provenance and verification limits.
+
+Pooling is parameter-free, so matching ticker/window/tau inputs are seed-independent.
+All three seed CSVs are verified, but examples are deduplicated. The 30-run table
+counts these repetitions explicitly; the unique table avoids treating them as
+independent observations. Quantiles are descriptive; overlapping windows are not
+independent statistical samples. Quantiles, empty/N counts and largest-change
+examples are also printed. Existing report directories are rejected.
+
+Historical window_evidence fingerprints cover OHLC, targets and dates, **not raw
+embedding values**. Saved temporal diagnostics can be checked against current
+parquet windows, but matching cosine densities/weights alone cannot prove that
+historical vector norms were identical. The manifest records this limit and saves
+the current reconstructed text fingerprint. Missing historical OHLC evidence is
+labeled partial rather than full. Embedding similarity remains a proxy for
+repeated information, not an established identity between events.
