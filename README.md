@@ -551,3 +551,80 @@ weight columns receive exactly zero gradients in the ablation and can receive
 nonzero gradients with novelty, initial states/predictions and batch order match,
 both checkpoints and diagnostics restore correctly, and the mocked dispatcher
 contains exactly 600 unique combinations plus two checks in the prescribed order.
+
+### Price-context-only gate: isolated pair-availability ablation
+
+`--group_gate context_price_only` keeps `Linear(18,5)` and its zero initialization,
+but passes `concat(price_context_8, zeros_like(novelty), zeros_like(pair_available))`
+to the gate. Relative to context_no_novelty, only the five pair-availability inputs
+are removed. The embeddings, independent linear heads and mask after each head
+retain their behavior. Alpha is fixed at 0.1 and fusion remains anchored blend.
+Initial FiLM/head parameters, initial forecasts and train batch order match the
+other conditions at the same seed.
+
+Validation diagnostics keep real `novelty` and `pair_available` alongside
+`novelty_used` and the new `pair_available_used`. Both used fields are zero in
+context_price_only. Existing conditions retain their actual gate inputs. The CSV
+and plots are exported from the best validation checkpoint; saved configuration
+selects the condition during reconstruction.
+
+Inside the existing Docker, from the code checkout:
+
+```bash
+bash -n run_context_price_only_30.sh
+bash run_context_price_only_30.sh
+```
+
+The dispatcher first runs a separate NVDA seed=7 one-epoch check. It then trains
+30 new runs for AAPL, ABBV, ABT, ACN, ADBE, ADI, AMAT, AMD, AMGN, AMZN × seeds
+7/17/27. Settings remain FiLM, seq_len=64, label_len=16, pred_len=3, batch_size=32,
+five Linear(384,3) heads, alpha=0.1, Adam lr=0.001, max epochs=50, patience=10.
+The train-only scaler, temporal splits, missing-text handling and metrics are
+unchanged. CUDA preflight, log tails, artifact checks, overwrite guards, SHA/script
+recording and CODE_COMMIT fallback are preserved. Results are separate:
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_only_10_v1/
+  checks/context_price_only/NVDA/seed7/{train.log,output/}
+  full/context_price_only/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+After the server runs finish, compare their saved metrics on CPU:
+
+```bash
+python analyze_context_price_only.py
+```
+
+The script reads the same ten tickers and three seeds from the new runs,
+`context_novelty_100_v1/full/context_no_novelty/`, and
+`film_compare_50ep_v1/full/baseline/`. No inference model or training entry point
+is loaded. It checks saved FiLM/window/training settings, ticker/seed identity,
+checkpoint selection epoch, split policy and saved OHLC scaler agreement. The
+two controlled variants must also match novelty/sampling policies and head/gate
+structures. A primary mismatch stops analysis; an unavailable or incompatible
+historical baseline is labeled with a reason and excluded from paired comparisons
+and selection. Available raw baseline errors remain visible. This is a saved
+configuration/scaler comparison; it does not replay parquet data or verify saved
+test windows. Missing metrics are never replaced by another split's errors.
+
+`--results_root`, `--reference_root`, `--baseline_root`, and `--output_dir` can
+relocate inputs/reports. Reports default to the new results root's
+`diagnostics/comparison_10/`, and an existing report directory is rejected:
+
+- `per_run.csv`: validation MSE, test MSE/MAE, actual source fields and comparability.
+- `per_ticker.csv`: each stock's three-seed averages.
+- `by_seed.csv`: each seed's arithmetic means over all ten stocks.
+- `across_seeds.csv`: mean and sample std (ddof=1) between the three seed means.
+- `paired_by_ticker.csv`: paired differences after averaging seeds; left minus
+  right, negative means the left variant has lower error.
+- `wins.csv`: strict wins and ties for each pair/metric after averaging seeds,
+  with the confirmed denominator out of ten.
+- `issues.csv`: missing metrics and baseline comparability failures.
+- `selection.json`: variant(s) minimizing mean validation MSE; test errors never
+  participate in selection. Averages require complete cohorts rather than subsets.
+
+Seed/statistics tables, paired stock differences, win counts and selection are
+also printed. Tests cover pair-availability invariance with a nonzero gate,
+presence masking, zero gradients in the ten unused columns, matched initialization
+and batching, checkpoint/diagnostic restoration, a mocked 1+30 queue, statistical
+aggregation, mismatch exclusions, read-only analysis and validation-only selection.

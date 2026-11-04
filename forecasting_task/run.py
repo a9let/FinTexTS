@@ -69,7 +69,7 @@ def parse_args(argv=None):
     parser.add_argument("--text_weight", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
-    parser.add_argument("--group_gate", choices=["static", "context_novelty", "context_no_novelty"], default=None,
+    parser.add_argument("--group_gate", choices=["static", "context_novelty", "context_no_novelty", "context_price_only"], default=None,
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
     parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
     parser.add_argument(

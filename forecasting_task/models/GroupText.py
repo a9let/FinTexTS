@@ -184,8 +184,8 @@ class ContextNoveltyTextModel(nn.Module):
                  initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
                  group_gate="static"):
         super().__init__()
-        if group_gate not in ("static", "context_novelty", "context_no_novelty"):
-            raise ValueError("group_gate must be static, context_novelty or context_no_novelty")
+        if group_gate not in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
+            raise ValueError("Unknown group_gate condition")
         if tuple(used_col_prefixes) != TEXT_GROUPS or num_layers != 1 or pred_len < 1:
             raise ValueError("group_gate requires five ordered groups and one linear layer")
         if initial_text_weight != 0.1 or fusion_mode != "blend":
@@ -233,8 +233,9 @@ class ContextNoveltyTextModel(nn.Module):
             raise ValueError("Expected novelty and pair_available [batch,5]")
         context = torch.cat((price_window[:, -1] - price_window[:, -2],
                              price_window[:, -1] - price_window[:, -6]), dim=-1)
-        novelty_used = torch.zeros_like(novelty) if self.group_gate == "context_no_novelty" else novelty
-        features = torch.cat((context, novelty_used, pair_available), dim=-1)
+        novelty_used = torch.zeros_like(novelty) if self.group_gate in ("context_no_novelty", "context_price_only") else novelty
+        pair_available_used = torch.zeros_like(pair_available) if self.group_gate == "context_price_only" else pair_available
+        features = torch.cat((context, novelty_used, pair_available_used), dim=-1)
         if self.gate is None:
             weights = embeddings.new_full((batch, 5), 0.2)
         else:
@@ -249,6 +250,7 @@ class ContextNoveltyTextModel(nn.Module):
         if return_details:
             return output, {"weights": weights, "heads": heads, "present": present,
                             "novelty": novelty, "novelty_used": novelty_used, "pair_available": pair_available,
+                            "pair_available_used": pair_available_used,
                             "contributions": self.fixed_alpha * weighted, "features": features}
         return output
 

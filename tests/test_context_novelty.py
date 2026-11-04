@@ -106,7 +106,7 @@ class ContextNoveltyTests(unittest.TestCase):
                         self.assertEqual((head[0].in_features, head[0].out_features), (384, 3))
 
     def test_mask_after_bias_and_no_presence_renormalization(self):
-        for mode in ("static", "context_novelty", "context_no_novelty"):
+        for mode in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
             model = ContextNoveltyTextModel(64, 3, 1, group_gate=mode)
             for head in model.group_mlps.values():
                 nn.init.zeros_(head[0].weight)
@@ -237,7 +237,7 @@ class ContextNoveltyTests(unittest.TestCase):
     def test_matched_film_heads_rng_predictions_and_training_permutations(self):
         for seed in (7, 17, 27):
             reference = None
-            for gate in ("static", "context_novelty", "context_no_novelty"):
+            for gate in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
                 run.set_seed(seed)
                 film = self.make_film()
                 text = ContextNoveltyTextModel(64, 3, 1, group_gate=gate)
@@ -273,7 +273,7 @@ class ContextNoveltyTests(unittest.TestCase):
 
     def test_runner_checkpoint_and_reproduced_best_validation_diagnostics(self):
         frame = make_frame()
-        for gate in ("static", "context_novelty", "context_no_novelty"):
+        for gate in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
             with self.subTest(gate=gate), tempfile.TemporaryDirectory() as directory:
                 datasets = {flag: make_dataset(frame, flag) for flag in ("train", "val", "test")}
                 loaders = {flag: DataLoader(dataset, batch_size=4, shuffle=flag == "train", drop_last=flag == "train")
@@ -338,8 +338,10 @@ class ContextNoveltyTests(unittest.TestCase):
                 self.assertEqual(rows[0]["input_end_date"], datasets["val"].window_end_date(0))
                 self.assertTrue(any(float(row["novelty"]) > 0 for row in rows))
                 for row in rows:
-                    expected_novelty = 0.0 if gate == "context_no_novelty" else float(row["novelty"])
+                    expected_novelty = 0.0 if gate in ("context_no_novelty", "context_price_only") else float(row["novelty"])
                     self.assertEqual(float(row["novelty_used"]), expected_novelty)
+                    expected_pair = 0 if gate == "context_price_only" else int(row["pair_available"])
+                    self.assertEqual(int(row["pair_available_used"]), expected_pair)
                     for h in range(1, 4):
                         expected = 0.1 * float(row["weight"]) * int(row["present"]) * float(row[f"head_h{h}"])
                         self.assertAlmostEqual(float(row[f"contribution_h{h}"]), expected, places=6)
