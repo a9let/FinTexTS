@@ -37,7 +37,8 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
                 next_index += 1
                 date = dataset.window_end_date(index)
                 pool = getattr(text_model, "text_temporal_pool", "last")
-                text_start, text_end = dataset.text_window_bounds(index, 5 if pool == "mean5" else 1)
+                width = 1 if pool == "last" else 5
+                text_start, text_end = dataset.text_window_bounds(index, width)
                 dates.append(np.datetime64(date))
                 weights.append(detail["weights"][sample])
                 contributions.append(detail["contributions"][sample])
@@ -52,6 +53,13 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
                               "pair_available": int(detail["pair_available"][sample, group_index]),
                               "pair_available_used": int(detail["pair_available_used"][sample, group_index]),
                               "weight": float(detail["weights"][sample, group_index])}
+                    if pool == "decay5":
+                        record["text_half_life"] = text_model.text_half_life
+                        for day, day_date in enumerate(dataset.text_window_dates(index, width)):
+                            record[f"text_date_{day + 1}"] = day_date
+                            record[f"row_age_{day + 1}"] = int(detail["row_ages"][day])
+                            record[f"daily_present_{day + 1}"] = int(detail["daily_present"][sample, day, group_index])
+                            record[f"temporal_weight_{day + 1}"] = float(detail["temporal_weights"][sample, day, group_index])
                     for horizon in range(args.pred_len):
                         record[f"head_h{horizon + 1}"] = float(detail["heads"][sample, group_index, horizon])
                         record[f"contribution_h{horizon + 1}"] = float(detail["contributions"][sample, group_index, horizon])

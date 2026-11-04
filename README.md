@@ -736,3 +736,143 @@ using mean validation MSE; test scores and the two references do not select pool
 the **same five dataset rows**, holding the price-only gate, head architecture,
 alpha, split policy and training budget fixed. That second mechanism is not
 implemented in this experiment.
+
+### Fixed recency weighting: decay5 versus mean5
+
+This branch starts from context-price-mean5 and adds a separate recency experiment.
+`--text_temporal_pool decay5 --text_half_life 2.0` uses only the last five rows of
+the current input window, separately for macro, sector, targetCompany,
+relatedCompany and filing. Existing last/mean5 pooling retains its numerical
+behavior. There is no similarity-based pooling in this branch.
+
+Half-life is a fixed finite, strictly positive hyperparameter, not a Parameter.
+For rows ordered oldest to newest:
+
+```text
+age = [4, 3, 2, 1, 0]                       # dataset rows, NOT calendar days
+present_i = abs(float32(e_i)).sum() >= 1e-6
+u_i = present_i * 2 ** (-age_i / text_half_life)
+a_i = u_i / sum_j(u_j)                      # normalize separately per group
+aggregated = sum_i(a_i * original_embedding_i)
+```
+
+At half_life=2 the unnormalized all-present weights are
+`[1/4, 1/(2*sqrt(2)), 1/2, 1/sqrt(2), 1]`. Missing rows keep their original ages;
+they do not compress the remaining age gaps. A single available vector has weight
+one. An empty group has a zero aggregate and zero temporal weights. Group presence
+is count>0 even if weighted vectors cancel to zero. Neither the vectors nor their
+aggregate receive additional normalization. No future rows, forward/backward fill
+or search outside the five rows is used; forward-fill dataset paths are rejected.
+For numerical stability a common age offset per group can be subtracted before
+the exponential. Normalization cancels this offset, preserving original age gaps
+and making a lone old vector safe even at a very small positive half-life.
+
+```mermaid
+flowchart TD
+    T["Known input text window: separate groups"] --> W["Last five dataset rows"]
+    W --> M["Daily float32 L1 presence masks"]
+    A["Fixed row ages 4,3,2,1,0; half-life 2"] --> U["present * 2 to the power of negative age / half-life"]
+    M --> U
+    U --> N["Normalize temporal weights within each group"]
+    W --> E["Original embedding vectors with original norms"]
+    E --> V["Temporal weighted sum per group"]
+    N --> V
+    V --> H["Five independent Linear(384,3) heads"]
+    M --> P["Group present if any daily vector is present"]
+    H --> D["Mask after Linear; weighted sum across groups"]
+    P --> D
+    X["Known normalized OHLC window"] --> F["FiLM prediction"]
+    X --> G["Price context 8 + zeros 10; Linear(18,5) and softmax"]
+    G --> D
+    X --> L["Last known OHLC repeated across horizon"]
+    F --> O["0.9 FiLM + 0.1 last OHLC + 0.1 group correction"]
+    L --> O
+    D --> O
+```
+
+The context_price_only gate is unchanged and still starts at zero logits, giving
+group weights 0.2. novelty_used and pair_available_used remain zero. Temporal
+masks/counts/weights never enter the gate. Alpha remains fixed at 0.1 with blend;
+FiLM and all five heads/gate train jointly from scratch, without loading trained
+mean5 weights. No trainable parameters are added. Initialization and train batch
+permutations match mean5 for the same seed. Train-only scaling, temporal splits,
+loss, metrics, Adam, early stopping and best validation-MSE selection are retained.
+
+Inside the existing server Docker, from the checkout:
+
+```bash
+bash -n run_context_price_decay5_30.sh
+bash run_context_price_decay5_30.sh
+```
+
+One NVDA seed7 check runs for one epoch, then 30 new main runs use AAPL, ABBV, ABT,
+ACN, ADBE, ADI, AMAT, AMD, AMGN, AMZN × seeds 7/17/27. All use half_life=2.0,
+FiLM, seq_len=64, label_len=16, pred_len=3, batch_size=32, five linear heads,
+Adam lr=0.001, max epochs=50 and patience=10. DATA stays
+`/auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts`.
+Results use `/auto/datasets/kondyurin/FinTexTS/runs/context_price_decay5_10_v1`:
+
+```text
+checks/context_price_only/NVDA/seed7/{train.log,output/}
+full/context_price_only/{ticker}/seed{seed}/{train.log,output/}
+```
+
+CUDA preflight, no-overwrite guards, artifact checks, failure log tails,
+SHA/script copies, CODE_COMMIT fallback and N/30 progress are preserved. Checks
+do not count toward 30. Existing training results are neither reused nor moved.
+
+Args, best checkpoint and summary record pooling and text_half_life; checkpoint
+reconstruction restores these settings, including nondefault positive half-lives
+in direct runs. Old configs default to half_life=2.0, which does not affect their
+saved last/mean5 pooling. Epoch history records the fixed setting. window_evidence
+is saved exactly as for mean5. Validation CSV/plots come from the best checkpoint,
+and decay CSV rows additionally include text_date_1..5, row_age_1..5,
+daily_present_1..5 and temporal_weight_1..5, plus text_half_life. Existing group
+presence/weight and signed contribution_h1..h3 fields are retained.
+
+After training, run the CPU comparison:
+
+```bash
+python analyze_context_price_decay5.py
+```
+
+The primary pair is decay5 versus saved mean5 in context_price_mean5_10_v1.
+Last in context_price_only_10_v1 and original baseline in film_compare_50ep_v1
+are additional references. Exactly the same ten tickers and seeds are compared.
+The new experiment must have half_life=2.0. Configuration/scaler/split checks and
+replayed window fingerprints, saved normalized test arrays and validation dates
+establish the available window evidence. Per-run window_verification and its
+printed/saved summary distinguish:
+
+- full: saved val/test fingerprints, normalized test arrays and validation dates
+  all agree with replay;
+- partial: evidence agrees where available, but some historical evidence is
+  missing. Replayed validation targets do not prove old target values;
+- mismatch: fingerprints, normalized arrays or dates contradict the replay;
+- not_checked: earlier configuration/scaler/metadata checks failed.
+
+These fingerprints cover normalized OHLC inputs, future targets and dates;
+they do not certify historical raw embedding values.
+
+The primary pair requires full evidence. A primary inconsistency or partial
+verification saves the report but blocks variant selection and makes the CLI exit
+unsuccessfully. Partial legacy references remain explicitly labeled partial.
+Reported issues identify the failing checks. No inference models or training
+entry points are constructed by the analysis.
+
+Reports go to the new root's diagnostics/comparison_10, with overrides
+--results_root, --mean5_root, --last_root, --baseline_root, --data_root, --output_dir.
+They include per_run/per_ticker, by_seed/across_seeds, relative_by_seed,
+paired_by_ticker, wins, target_windows, issues, window_verification,
+window_verification_summary and selection.json. Metrics are validation MSE and
+test MSE/MAE. Stock means average seeds first; seed means average the same ten
+stocks, and their sample std uses ddof=1. Relative changes and differences are
+left-minus-right (negative means lower error for the left variant). Only mean
+validation MSE selects between decay5 and mean5; test errors and references do
+not select pooling. Existing report directories are rejected.
+
+CPU synthetic tests cover explicit age weights, unchanged age gaps with missing
+rows, empty/single/cancelled groups, original norms, group isolation and causal
+alignment, last/mean5 compatibility, initialization/batch ordering, checkpoint and
+best-checkpoint diagnostic recovery, the 1+30 queue, window verification statuses
+and validation-only selection.
