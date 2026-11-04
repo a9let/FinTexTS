@@ -24,7 +24,7 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
         for batch in loader:
             x, text, x_mark, y_mark, decoder, target = prepare_batch(batch, device, args.pred_len, args.label_len)
             metadata = {key: value.float().to(device) for key, value in batch[6].items()}
-            output, detail = text_model(model(x, x_mark, decoder, y_mark), x[:, -1], text[:, -1],
+            output, detail = text_model(model(x, x_mark, decoder, y_mark), x[:, -1], text,
                                         price_window=x, return_details=True, **metadata)
             error = (output - target).double()
             squared_sum += error.square().sum().item()
@@ -36,11 +36,16 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
                     raise ValueError("Validation diagnostic windows must be complete and in dataset order")
                 next_index += 1
                 date = dataset.window_end_date(index)
+                pool = getattr(text_model, "text_temporal_pool", "last")
+                text_start, text_end = dataset.text_window_bounds(index, 5 if pool == "mean5" else 1)
                 dates.append(np.datetime64(date))
                 weights.append(detail["weights"][sample])
                 contributions.append(detail["contributions"][sample])
                 for group_index, group in enumerate(TEXT_GROUPS):
                     record = {"window_index": index, "input_end_date": date, "group": group,
+                              "text_temporal_pool": pool, "text_window_start_date": text_start,
+                              "text_window_end_date": text_end,
+                              "available_dates": int(detail["available_count"][sample, group_index]),
                               "present": int(detail["present"][sample, group_index]),
                               "novelty": float(detail["novelty"][sample, group_index]),
                               "novelty_used": float(detail["novelty_used"][sample, group_index]),

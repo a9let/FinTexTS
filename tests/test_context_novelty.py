@@ -273,8 +273,10 @@ class ContextNoveltyTests(unittest.TestCase):
 
     def test_runner_checkpoint_and_reproduced_best_validation_diagnostics(self):
         frame = make_frame()
-        for gate in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
-            with self.subTest(gate=gate), tempfile.TemporaryDirectory() as directory:
+        cases = [(gate, "last") for gate in ("static", "context_novelty", "context_no_novelty", "context_price_only")]
+        cases.append(("context_price_only", "mean5"))
+        for gate, pool in cases:
+            with self.subTest(gate=gate, pool=pool), tempfile.TemporaryDirectory() as directory:
                 datasets = {flag: make_dataset(frame, flag) for flag in ("train", "val", "test")}
                 loaders = {flag: DataLoader(dataset, batch_size=4, shuffle=flag == "train", drop_last=flag == "train")
                            for flag, dataset in datasets.items()}
@@ -295,6 +297,7 @@ class ContextNoveltyTests(unittest.TestCase):
                                     head[0].bias.add_(1000)
                     return result
                 argv = ["--model_type", "FiLM", "--group_gate", gate, "--code_commit", "a" * 40,
+                        "--text_temporal_pool", pool,
                         "--seq_len", "6", "--label_len", "2", "--pred_len", "3", "--batch_size", "4",
                         "--e_layers", "1", "--num_epoch", "2", "--logdir", directory]
                 with patch("forecasting_task.data_provider.context_novelty.get_context_novelty_dataloader", side_effect=factory), \
@@ -309,6 +312,11 @@ class ContextNoveltyTests(unittest.TestCase):
                 summary = json.loads((root / "summary.json").read_text())
                 checkpoint = torch.load(root / "best_checkpoint.pt", map_location="cpu", weights_only=True)
                 self.assertEqual(checkpoint["args"], args)
+                self.assertEqual(args["text_model_config"]["text_temporal_pool"], pool)
+                self.assertEqual(summary["text_temporal_pool"], pool)
+                if pool == "mean5":
+                    self.assertEqual(summary["window_evidence"], args["window_evidence"])
+                    self.assertTrue((root / "window_evidence.json").is_file())
                 self.assertEqual(checkpoint["epoch"], 1)
                 self.assertEqual(summary["epochs_completed"], 2)
                 self.assertEqual(checkpoint["metrics"], history[checkpoint["epoch"] - 1])
@@ -338,6 +346,15 @@ class ContextNoveltyTests(unittest.TestCase):
                 self.assertEqual(rows[0]["input_end_date"], datasets["val"].window_end_date(0))
                 self.assertTrue(any(float(row["novelty"]) > 0 for row in rows))
                 for row in rows:
+                    index = int(row["window_index"])
+                    group = TEXT_GROUPS.index(row["group"])
+                    width = 5 if pool == "mean5" else 1
+                    text_window = datasets["val"][index][2][-width:, group]
+                    count = int((np.abs(text_window.astype(np.float32)).sum(-1) >= 1e-6).sum())
+                    self.assertEqual(int(row["available_dates"]), count)
+                    self.assertEqual(int(row["present"]), int(count > 0))
+                    start, end = datasets["val"].text_window_bounds(index, width)
+                    self.assertEqual((row["text_window_start_date"], row["text_window_end_date"]), (start, end))
                     expected_novelty = 0.0 if gate in ("context_no_novelty", "context_price_only") else float(row["novelty"])
                     self.assertEqual(float(row["novelty_used"]), expected_novelty)
                     expected_pair = 0 if gate == "context_price_only" else int(row["pair_available"])

@@ -628,3 +628,111 @@ also printed. Tests cover pair-availability invariance with a nonzero gate,
 presence masking, zero gradients in the ten unused columns, matched initialization
 and batching, checkpoint/diagnostic restoration, a mocked 1+30 queue, statistical
 aggregation, mismatch exclusions, read-only analysis and validation-only selection.
+
+### Price-only gate with a five-row text mean
+
+`--text_temporal_pool last|mean5` defaults to `last`, preserving the previous
+last-input-row behavior. `mean5` is an isolated option for `context_price_only`.
+For each group, it considers exactly the last five **dataset rows** of the current
+input window (not five calendar days or the last five nonempty dates). Daily
+presence is computed before pooling with float32 `abs(vector).sum(-1) >= 1e-6`.
+Only present vectors enter the mean; a completely empty group gets a zero vector.
+There is no extra normalization, forward/backward fill or history search.
+Forward-fill dataset paths are rejected for mean5.
+
+Group presence is `available_dates > 0`, independently of the mean's norm.
+Opposite nonzero vectors can cancel to zero and still leave the group present.
+The independent Linear(384,3) head receives the mean and its output, including
+bias, is masked **after** Linear. The gate receives only the same eight price
+context features plus ten zeros. Neither counts nor window presence enter it.
+
+```mermaid
+flowchart TD
+    P["Known normalized OHLC window"] --> F["FiLM: price prediction"]
+    P --> C["Price context: X_last-X_prev, X_last-X_5rows_earlier"]
+    C --> G["Linear(18,5) + softmax: context_8 and zeros_10"]
+    T["Separate text groups in input window"] --> W["Last five dataset rows per group"]
+    W --> M["Daily float32 L1 presence masks"]
+    W --> A["Mean of present vectors per group"]
+    M --> A
+    M --> N["Count and present_in_window = count > 0"]
+    A --> H["Five independent Linear(384,3) heads"]
+    H --> D["Mask after heads; weighted sum of group corrections"]
+    N --> D
+    G --> D
+    P --> L["Last known normalized OHLC"]
+    F --> O["0.9 price + 0.1 last OHLC + 0.1 correction"]
+    L --> O
+    D --> O
+```
+
+The OHLC correction at each horizon is shared across channels. Alpha remains a
+fixed 0.1 buffer. Gate matrix/bias still start at zero and weights at 0.2.
+Pooling consumes no random numbers: at one seed FiLM/head initialization and train
+batch order match last. All other settings remain FiLM, groups macro/sector/
+targetCompany/relatedCompany/filing, seq_len=64, label_len=16, pred_len=3,
+batch_size=32, Adam lr=0.001, max epochs=50, patience=10, with the same train-only
+scaler, temporal splits, metrics and validation-MSE checkpoint selection.
+
+Inside the existing Docker, from the checkout:
+
+```bash
+bash -n run_context_price_mean5_30.sh
+bash run_context_price_mean5_30.sh
+```
+
+The script first runs NVDA seed7 for one epoch, then 30 main runs on AAPL, ABBV,
+ABT, ACN, ADBE, ADI, AMAT, AMD, AMGN, AMZN × seeds 7/17/27. DATA stays
+`/auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts`. The new root is
+`/auto/datasets/kondyurin/FinTexTS/runs/context_price_mean5_10_v1`, with
+`checks/context_price_only/NVDA/seed7/output` and
+`full/context_price_only/{ticker}/seed{seed}/output`, and adjacent train.log files.
+CUDA preflight, existing-directory rejection, artifact checks, failure log tails,
+SHA/script copies, CODE_COMMIT fallback and N/30 progress are preserved.
+
+args.yaml, history.jsonl, checkpoint and summary record text_temporal_pool.
+Validation CSV/plots still come from the best checkpoint. CSV rows now also
+record inclusive `text_window_start_date`, `text_window_end_date`,
+`available_dates` per group and the actual `present` mask. Dates come from real
+dataset row indices. New mean5 runs save `window_evidence.json`, also embedded
+in checkpoint args and summary: window counts/shapes and float32 SHA-256 hashes
+of normalized val/test inputs, future targets, input-end dates and target dates.
+Old checkpoint configs without a pooling field restore as last.
+
+After training, run the comparison on CPU:
+
+```bash
+python analyze_context_price_mean5.py
+```
+
+The primary comparison is mean5 versus last from `context_price_only_10_v1`.
+The same stocks/seeds from `context_novelty_100_v1/full/context_no_novelty` and
+`film_compare_50ep_v1/full/baseline` are additional references. Saved settings,
+scalers, split policy and head/gate structures are checked. Val/test windows are
+replayed with Dataset_Custom and their normalized targets, inputs and dates are
+fingerprinted. New mean5 saved fingerprints must match; normalized `inputs` and
+`ground_truths` in each test_io.pt must match the replay exactly. Inverse arrays
+are never used. Saved validation diagnostic dates/order must agree when available
+(required for the controlled variants). Legacy runs lack saved validation target
+tensors: their validation evidence is the replayed configuration/targets and saved
+input-end dates, rather than a historical target-tensor hash. Per-run
+`window_verification` records the available evidence. A primary mismatch stops the
+report; incompatible or unavailable extra references are explicitly excluded from
+paired comparisons while available raw metrics remain visible.
+
+Reports default to the new root's `diagnostics/comparison_10/`. CLI overrides are
+`--results_root`, `--last_root`, `--reference_root`, `--baseline_root`, `--data_root`,
+and `--output_dir`. Existing report directories and training results are preserved.
+Outputs include per_run/per_ticker, by_seed and across_seeds tables for validation
+MSE and test MSE/MAE; sample std is between three seed means with ddof=1.
+paired_by_ticker and wins compare all pairs after averaging seeds. Negative
+left-minus-right and relative changes mean lower error for the left variant.
+relative_by_seed contains seed-relative changes, their mean/sample std, and the
+relative change of the overall means. target_windows records replayed signatures,
+and issues records exclusions. selection.json chooses only between mean5 and last
+using mean validation MSE; test scores and the two references do not select pooling.
+
+**Mandatory next stage:** compare mean5 with a repetition-aware aggregation of
+the **same five dataset rows**, holding the price-only gate, head architecture,
+alpha, split policy and training budget fixed. That second mechanism is not
+implemented in this experiment.

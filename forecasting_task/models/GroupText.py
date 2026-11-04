@@ -177,12 +177,34 @@ class FixedUniformTextModel(nn.Module):
         return (1 - alpha) * price_output + alpha * text_prediction
 
 
+def pool_text_window(embeddings, mode="last"):
+    """Pool dataset rows per group; presence is determined BEFORE averaging."""
+    if mode not in ("last", "mean5"):
+        raise ValueError("text_temporal_pool must be last or mean5")
+    if embeddings.ndim == 3 and mode == "last":
+        embeddings = embeddings.unsqueeze(1)
+    if embeddings.ndim != 4 or embeddings.shape[2:] != (5, EMBEDDING_SIZE):
+        raise ValueError("Expected text window [batch, rows, 5, 384]")
+    rows = 5 if mode == "mean5" else 1
+    if embeddings.shape[1] < rows:
+        raise ValueError(f"{mode} requires at least {rows} input rows")
+    window = embeddings[:, -rows:]
+    daily_present = window.float().abs().sum(dim=-1) >= 1e-6
+    counts = daily_present.sum(dim=1)
+    if mode == "last":
+        pooled = window[:, -1]
+    else:
+        masked = torch.where(daily_present.unsqueeze(-1), window, torch.zeros_like(window))
+        pooled = masked.sum(dim=1) / counts.clamp_min(1).unsqueeze(-1).to(window.dtype)
+    return pooled, counts > 0, counts
+
+
 class ContextNoveltyTextModel(nn.Module):
     """Fixed-alpha anchored fusion with uniform or context-dependent group weights."""
 
     def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
                  initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
-                 group_gate="static"):
+                 group_gate="static", text_temporal_pool="last"):
         super().__init__()
         if group_gate not in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
             raise ValueError("Unknown group_gate condition")
@@ -190,8 +212,11 @@ class ContextNoveltyTextModel(nn.Module):
             raise ValueError("group_gate requires five ordered groups and one linear layer")
         if initial_text_weight != 0.1 or fusion_mode != "blend":
             raise ValueError("group_gate requires fixed alpha=0.1 and anchored blend")
+        if text_temporal_pool not in ("last", "mean5") or (text_temporal_pool == "mean5" and group_gate != "context_price_only"):
+            raise ValueError("mean5 is supported only with context_price_only")
         validate_fixed_uniform_weights(initial_group_weights, 5)
         self.used_col_prefixes, self.pred_len, self.group_gate = TEXT_GROUPS, pred_len, group_gate
+        self.text_temporal_pool = text_temporal_pool
         self.group_mlps = nn.ModuleDict({
             group: nn.Sequential(nn.Linear(EMBEDDING_SIZE, pred_len)) for group in TEXT_GROUPS
         })
@@ -213,7 +238,8 @@ class ContextNoveltyTextModel(nn.Module):
         return dict.fromkeys(TEXT_GROUPS, 0.2)
 
     def fusion_state(self):
-        state = {"group_gate": self.group_gate, "text_weight_mode": "fixed", "fixed_alpha": 0.1,
+        state = {"group_gate": self.group_gate, "text_temporal_pool": self.text_temporal_pool,
+                 "text_weight_mode": "fixed", "fixed_alpha": 0.1,
                  "text_alpha": self.get_alpha().detach().cpu().item()}
         if self.group_gate == "static":
             state["fixed_group_coefficients"] = self.fixed_group_coefficients()
@@ -221,6 +247,7 @@ class ContextNoveltyTextModel(nn.Module):
 
     def forward(self, price_output, last_price, embeddings, *, price_window, novelty,
                 pair_available, return_details=False):
+        embeddings, present, available_count = pool_text_window(embeddings, self.text_temporal_pool)
         batch = embeddings.shape[0]
         if embeddings.ndim != 3 or embeddings.shape[1:] != (5, 384):
             raise ValueError("Expected last-day embeddings [batch, 5, 384]")
@@ -240,7 +267,6 @@ class ContextNoveltyTextModel(nn.Module):
             weights = embeddings.new_full((batch, 5), 0.2)
         else:
             weights = torch.softmax(self.gate(features), dim=-1)
-        present = embeddings.abs().sum(dim=-1) >= 1e-6
         heads = torch.stack([self.group_mlps[group](embeddings[:, index])
                              for index, group in enumerate(TEXT_GROUPS)], dim=1)
         masked = heads * present.unsqueeze(-1).to(heads.dtype)
@@ -249,6 +275,7 @@ class ContextNoveltyTextModel(nn.Module):
         output = (1 - self.fixed_alpha) * price_output + self.fixed_alpha * (last_price.unsqueeze(1) + delta)
         if return_details:
             return output, {"weights": weights, "heads": heads, "present": present,
+                            "available_count": available_count, "pooled_embeddings": embeddings,
                             "novelty": novelty, "novelty_used": novelty_used, "pair_available": pair_available,
                             "pair_available_used": pair_available_used,
                             "contributions": self.fixed_alpha * weighted, "features": features}

@@ -66,6 +66,7 @@ def parse_args(argv=None):
     
     parser.add_argument("--text_hidden_size", type=int, default=64)
     parser.add_argument("--text_num_layers", type=int, default=1)
+    parser.add_argument("--text_temporal_pool", choices=["last", "mean5"], default="last")
     parser.add_argument("--text_weight", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
@@ -104,6 +105,9 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.text_temporal_pool == "mean5":
+        if args.group_gate != "context_price_only" or args.seq_len < 5 or "fnspid" in args.data_path:
+            parser.error("mean5 requires context_price_only, seq_len>=5 and data without forward fill")
     if args.group_weight_mode is None:
         args.group_weight_mode = "fixed_uniform" if args.group_gate else "learnable"
     if args.group_gate:
@@ -158,6 +162,7 @@ def parse_args(argv=None):
     }
     if args.group_gate:
         args.text_model_config["group_gate"] = args.group_gate
+        args.text_model_config["text_temporal_pool"] = args.text_temporal_pool
         if args.group_gate != "static":
             args.group_weight_mode = args.group_gate
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
@@ -246,7 +251,7 @@ def _run_epoch(
         output = model(seq_price_x, seq_x_mark, dec_inp, seq_y_mark)
         if getattr(args, "group_gate", None):
             metadata = {key: value.float().to(device) for key, value in batch[6].items()}
-            output = text_model(output, seq_price_x[:, -1], seq_text_x[:, -1], price_window=seq_price_x, **metadata)
+            output = text_model(output, seq_price_x[:, -1], seq_text_x, price_window=seq_price_x, **metadata)
         else:
             output = text_model(output, seq_price_x[:, -1, :], seq_text_x[:, -1, :, :])
 
@@ -317,6 +322,11 @@ def main(argv=None):
         batch_size=args.batch_size,
     )
     train_generator = _configure_gate_sampling(train_dataloader, args.seed) if args.group_gate else None
+    if args.text_temporal_pool == "mean5":
+        from forecasting_task.window_evidence import window_evidence
+        args.window_evidence = {"val": window_evidence(val_dataset), "test": window_evidence(test_dataset)}
+        with open(os.path.join(args.logdir, "window_evidence.json"), "x", encoding="utf-8") as handle:
+            json.dump(args.window_evidence, handle, indent=2)
     if args.model_type.lower() == "dlinear":
         model = DLinear(args)
     elif args.model_type.lower() == "patchtst":
@@ -492,7 +502,8 @@ def main(argv=None):
                 "scaler_var": train_dataset.scaler.var_.tolist(),
             }
             if args.group_gate:
-                checkpoint.update(group_gate=args.group_gate, fixed_alpha=0.1, text_weight_mode="fixed",
+                checkpoint.update(group_gate=args.group_gate, text_temporal_pool=args.text_temporal_pool,
+                                  fixed_alpha=0.1, text_weight_mode="fixed",
                                   code_commit=args.code_commit, train_generator_state=train_generator.get_state())
 
             checkpoint_path = os.path.join(
@@ -578,6 +589,7 @@ def main(argv=None):
         "initial_text_weight": args.text_weight,
         "initial_text_alpha": args.initial_text_alpha,
         "text_mlp_structure": args.text_mlp_structure,
+        "text_temporal_pool": args.text_temporal_pool,
         "best_text_alpha": best_text_alpha,
         "final_text_alpha": final_fusion_state["text_alpha"],
         "used_col_prefixes": args.used_col_prefixes,
@@ -611,6 +623,8 @@ def main(argv=None):
                        gate_structure=args.gate_structure, novelty_policy=args.novelty_policy,
                        sampling_policy=args.sampling_policy, validation_diagnostics=gate_diagnostics,
                        diagnostic_seconds=diagnostic_seconds)
+    if args.text_temporal_pool == "mean5":
+        summary["window_evidence"] = args.window_evidence
 
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len

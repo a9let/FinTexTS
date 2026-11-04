@@ -99,6 +99,12 @@ class ContextNoveltyDataset(Dataset):
     def window_end_date(self, index):
         return str(self.row_dates[int(index) + self.seq_len - 1])
 
+    def text_window_bounds(self, index, rows):
+        if rows not in (1, 5) or rows > self.seq_len:
+            raise ValueError("Text window must contain one or five input rows")
+        end = int(index) + self.seq_len - 1
+        return str(self.row_dates[end - rows + 1]), str(self.row_dates[end])
+
     def inverse_transform(self, values):
         return self.base.inverse_transform(values)
 
