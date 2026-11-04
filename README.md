@@ -736,3 +736,166 @@ using mean validation MSE; test scores and the two references do not select pool
 the **same five dataset rows**, holding the price-only gate, head architecture,
 alpha, split policy and training budget fixed. That second mechanism is not
 implemented in this experiment.
+
+### Five-row self-attention with the original price-only gate
+
+Branch `experiment/context-price-attention5` starts from `experiment/context-price-mean5`.
+`--text_temporal_pool attention5` uses exactly the last five dataset rows of the
+current input window, independently for each of the five groups, in the order
+macro, sector, targetCompany, relatedCompany, filing. These are dataset rows,
+not necessarily calendar days. Presence is computed before aggregation using
+float32 L1 >= 1e-6. Missing rows are never filled, and rows outside this window
+are never searched. Existing `last` and `mean5` retain their behavior.
+
+For each group's original embeddings `e_i`, oldest to newest:
+
+```text
+ages = [4,3,2,1,0]
+x_i = concat(e_i, age_i/4)                  # 385 coordinates, Q/K only
+q_i = W_Q x_i; k_j = W_K x_j               # shared bias-free Linear(385,16)
+scores_ij = dot(q_i,k_j)/sqrt(16)
+A_ij = masked_softmax_j(scores_ij)          # exclude absent keys
+A_ij = 0 for absent query i
+z_i = sum_j A_ij * e_j                     # original 384-dimensional values
+aggregated = sum_present_i z_i / N_present_queries
+beta_j = sum_i A_ij / N_present_queries
+aggregated = sum_j beta_j * e_j
+```
+
+There is one Q/K pair shared across all five groups: **12,320 trainable
+parameters**. Groups do not attend to one another. There is no W_V, output
+projection, residual connection, FFN, LayerNorm or dropout. Age enters Q/K only;
+values keep their original coordinates and norms. All five rows are already
+known when forecasting, so no triangular mask is applied inside this historical
+window. Data after the input end is never used.
+
+Absent query rows in A and absent key weights are exactly zero. For an empty
+group, A, beta and the aggregate are zero, and the group mask is false. A safe
+softmax path avoids all-masked-row NaNs. For nonempty groups, each present query
+row of A sums to one and beta sums to one. A single present date has beta=1.
+Group presence is determined from daily masks, so cancellation in the aggregate
+does not make a present group disappear.
+
+W_Q starts at zero; W_K keeps `nn.Linear`'s ordinary random initialization. Both
+are created inside an isolated RNG block. Initially attention is uniform over
+present keys and agrees with mean5 up to floating-point rounding. Initial FiLM,
+group-head and gate parameters, RNG state and train batch order match mean5 at
+the same seed. W_Q can receive gradients on the first update; W_K can learn once
+W_Q has moved away from zero. FiLM, heads, gate and Q/K train jointly from scratch,
+and each parameter enters Adam exactly once.
+
+```mermaid
+flowchart LR
+    E["Last 5 input rows per group: original embeddings"] --> M[Daily presence masks]
+    E --> QK["Append age/4; shared W_Q and W_K: 385 to 16"]
+    QK --> A["Scaled dot products; masked softmax: A 5x5"]
+    M --> A
+    A --> B["Mean over present queries: beta"]
+    B --> P["Sum beta times original embeddings"]
+    E --> P
+    P --> H["5 independent Linear 384 to 3 heads"]
+    M --> D["Mask head outputs; weight by group gate"]
+    H --> D
+    X[Normalized input OHLC] --> G["Original price gate: lags 1 and 5; Linear 18 to 5"]
+    G --> D
+    X --> F[FiLM]
+    X --> L[Last known OHLC]
+    D --> O["0.9 FiLM + 0.1 last OHLC + signed text contributions"]
+    F --> O
+    L --> O
+```
+
+The remainder is the same controlled model as mean5: `context_price_only`, price
+lags `[1,5]`, zero novelty_used/pair_available_used, zero-initialized gate,
+five Linear(384,3) heads, fixed alpha=0.1 and anchored blend. The mask is applied
+after each head, based on any available text in the five-row window. The anchor
+survives fully missing text. No expanded price lags, decay or redundancy mechanism
+is introduced. FiLM, train-only scaler, temporal splits, loss/metrics, early
+stopping and best-validation-MSE checkpoint selection remain unchanged.
+
+The saved `attention_config` in args, checkpoint, summary and the reconstruction
+configuration describes dimensions, ages, masks, initialization, value/reduction
+rules and parameter count. State dictionaries save both projections. Loading a
+conflicting architecture description is rejected. `window_evidence` for validation
+and test is preserved as in mean5, including normalized OHLC input/target and date
+fingerprints.
+
+Validation diagnostics are exported from the best checkpoint, with the existing
+CSV and group-weight/contribution plots. Each window/group CSV row additionally
+records the five dates (`date_d1`...`date_d5`), ages, daily presence, all 25
+`attention_A_q*_k*` entries, five `beta_d*` coefficients, group weight and signed
+date contributions for each forecast horizon:
+
+```text
+C_g,j,h = 0.1 * w_g * beta_g,j * (W_g e_g,j + b_g)_h
+sum_j C_g,j,h = signed group contribution_g,h
+prediction = 0.9*FiLM + 0.1*last_price + sum_g,j C_g,j
+```
+
+Absent dates contribute zero. Diagnostics check both reconstruction identities
+with floating-point tolerance. A represents learned compatibility, beta represents
+aggregation coefficients, and C represents arithmetic contributions to the
+forecast. These quantities do not establish causal news effects or recognition
+of repeated events.
+
+Inside the existing Docker, from the code checkout:
+
+```bash
+bash -n run_context_price_attention5_30.sh
+bash run_context_price_attention5_30.sh
+```
+
+One NVDA seed=7 one-epoch check precedes exactly 30 main runs: AAPL ABBV ABT ACN
+ADBE ADI AMAT AMD AMGN AMZN, seeds 7/17/27. Settings are seq_len=64, label_len=16,
+pred_len=3, batch_size=32, Adam lr=0.001, max epochs=50, patience=10, all five
+groups and attention5. Results are separate:
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_attention5_10_v1/
+  checks/context_price_only/NVDA/seed7/{train.log,output/}
+  full/context_price_only/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+The dispatcher determines CODE from its own location, sets PYTHONPATH to CODE
+and CODE/forecasting_task, checks CUDA and input files, uses OMP/MKL threads=2,
+records SHA/script/tickers, refuses existing run directories and stops with the
+log tail on failure. Nonempty summary/checkpoint are required for OK. Progress
+excludes the check and ends with `ALL 30 RUNS COMPLETED`. Set `CODE_COMMIT` to the
+full commit SHA if Git metadata is unavailable inside Docker.
+
+After the runs finish, compare saved results on CPU without model inference:
+
+```bash
+python analyze_context_price_attention5.py
+```
+
+The primary comparison is attention5 versus mean5 from
+`context_price_mean5_10_v1`. Additional references are last from
+`context_price_only_10_v1` and original baseline from `film_compare_50ep_v1`.
+The analysis checks the same ten tickers and three seeds, saved configuration,
+split policy, scaler, normalized price windows and targets. It prints and saves
+per-run `window_verification` and status counts:
+
+- `full`: validation/test saved fingerprints, normalized test arrays and saved
+  validation dates all match replay.
+- `partial`: historical evidence is incomplete; the individual verified parts
+  and missing evidence are listed. Replayed validation targets alone cannot
+  certify historical target equality.
+- `mismatch`: saved evidence contradicts replay.
+- `not_checked`: an earlier configuration/scaler check failed.
+
+Both primary conditions require full evidence. A primary failure blocks selection
+and causes a nonzero CLI exit after reports are saved. Missing or incompatible
+benchmarks are explicitly excluded from paired comparisons; their available raw
+errors stay visible. Hashes certify OHLC windows/targets/dates, not historical
+embedding contents. Reports and `limitations.csv` make these limits explicit.
+
+Reports go to the new root's `diagnostics/comparison_10/`; existing reports are
+never overwritten. Paths can be overridden using `--results_root`, `--mean5_root`,
+`--last_root`, `--baseline_root`, `--data_root`, and `--output_dir`. Outputs include
+per_run/per_ticker CSV, ten-ticker means for each seed, mean/sample std (ddof=1)
+between the three seed means, paired ticker differences/wins after seed averaging,
+relative changes `100*(left-right)/right` (negative means lower error), verification
+details and issues. Validation MSE, test MSE and test MAE remain separate; missing
+metrics are not invented. Only attention5/mean5 validation MSE selects the primary
+variant in `selection.json`; test errors and extra references never select it.

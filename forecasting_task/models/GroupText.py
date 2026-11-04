@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import nn
+from forecasting_task.models.AttentionPool import AttentionPool5, attention5_config
 
 
 TEXT_GROUPS = ("macro", "sector", "targetCompany", "relatedCompany", "filing")
@@ -204,7 +205,7 @@ class ContextNoveltyTextModel(nn.Module):
 
     def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
                  initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
-                 group_gate="static", text_temporal_pool="last"):
+                 group_gate="static", text_temporal_pool="last", attention_config=None):
         super().__init__()
         if group_gate not in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
             raise ValueError("Unknown group_gate condition")
@@ -212,8 +213,11 @@ class ContextNoveltyTextModel(nn.Module):
             raise ValueError("group_gate requires five ordered groups and one linear layer")
         if initial_text_weight != 0.1 or fusion_mode != "blend":
             raise ValueError("group_gate requires fixed alpha=0.1 and anchored blend")
-        if text_temporal_pool not in ("last", "mean5") or (text_temporal_pool == "mean5" and group_gate != "context_price_only"):
-            raise ValueError("mean5 is supported only with context_price_only")
+        if (text_temporal_pool not in ("last", "mean5", "attention5")
+                or (text_temporal_pool != "last" and group_gate != "context_price_only")):
+            raise ValueError("mean5/attention5 are supported only with context_price_only")
+        if attention_config is not None and (text_temporal_pool != "attention5" or attention_config != attention5_config()):
+            raise ValueError("Saved attention configuration does not match attention5 architecture")
         validate_fixed_uniform_weights(initial_group_weights, 5)
         self.used_col_prefixes, self.pred_len, self.group_gate = TEXT_GROUPS, pred_len, group_gate
         self.text_temporal_pool = text_temporal_pool
@@ -228,6 +232,7 @@ class ContextNoveltyTextModel(nn.Module):
                 self.gate = nn.Linear(18, 5)
             nn.init.zeros_(self.gate.weight)
             nn.init.zeros_(self.gate.bias)
+        self.attention_pool = AttentionPool5() if text_temporal_pool == "attention5" else None
 
     def get_alpha(self):
         return self.fixed_alpha
@@ -247,7 +252,12 @@ class ContextNoveltyTextModel(nn.Module):
 
     def forward(self, price_output, last_price, embeddings, *, price_window, novelty,
                 pair_available, return_details=False):
-        embeddings, present, available_count = pool_text_window(embeddings, self.text_temporal_pool)
+        attention_details = {}
+        text_window = embeddings
+        if self.attention_pool is not None:
+            embeddings, present, available_count, attention_details = self.attention_pool(embeddings)
+        else:
+            embeddings, present, available_count = pool_text_window(embeddings, self.text_temporal_pool)
         batch = embeddings.shape[0]
         if embeddings.ndim != 3 or embeddings.shape[1:] != (5, 384):
             raise ValueError("Expected last-day embeddings [batch, 5, 384]")
@@ -274,11 +284,19 @@ class ContextNoveltyTextModel(nn.Module):
         delta = weighted.sum(dim=1).unsqueeze(-1).expand_as(price_output)
         output = (1 - self.fixed_alpha) * price_output + self.fixed_alpha * (last_price.unsqueeze(1) + delta)
         if return_details:
+            if self.attention_pool is not None:
+                daily_embeddings = text_window[:, -5:].transpose(1, 2)
+                daily_heads = torch.stack([self.group_mlps[group](daily_embeddings[:, index])
+                                           for index, group in enumerate(TEXT_GROUPS)], dim=1)
+                daily_contributions = (self.fixed_alpha * weights[:, :, None, None]
+                                       * attention_details["temporal_weights"][..., None] * daily_heads)
+                attention_details["daily_contributions"] = daily_contributions
             return output, {"weights": weights, "heads": heads, "present": present,
                             "available_count": available_count, "pooled_embeddings": embeddings,
                             "novelty": novelty, "novelty_used": novelty_used, "pair_available": pair_available,
                             "pair_available_used": pair_available_used,
-                            "contributions": self.fixed_alpha * weighted, "features": features}
+                            "contributions": self.fixed_alpha * weighted, "features": features,
+                            **attention_details}
         return output
 
 

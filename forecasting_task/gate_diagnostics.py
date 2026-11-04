@@ -24,8 +24,16 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
         for batch in loader:
             x, text, x_mark, y_mark, decoder, target = prepare_batch(batch, device, args.pred_len, args.label_len)
             metadata = {key: value.float().to(device) for key, value in batch[6].items()}
-            output, detail = text_model(model(x, x_mark, decoder, y_mark), x[:, -1], text,
+            price_output = model(x, x_mark, decoder, y_mark)
+            output, detail = text_model(price_output, x[:, -1], text,
                                         price_window=x, return_details=True, **metadata)
+            if text_model.text_temporal_pool == "attention5":
+                if not torch.allclose(detail["daily_contributions"].sum(2), detail["contributions"], rtol=1e-5, atol=1e-6):
+                    raise ValueError("Attention date contributions do not reconstruct group contributions")
+                reconstructed = ((1-text_model.fixed_alpha)*price_output + text_model.fixed_alpha*x[:, -1:]
+                                 + detail["contributions"].sum(1).unsqueeze(-1))
+                if not torch.allclose(reconstructed, output, rtol=1e-5, atol=1e-6):
+                    raise ValueError("Attention contributions do not reconstruct prediction")
             error = (output - target).double()
             squared_sum += error.square().sum().item()
             absolute_sum += error.abs().sum().item()
@@ -37,7 +45,7 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
                 next_index += 1
                 date = dataset.window_end_date(index)
                 pool = getattr(text_model, "text_temporal_pool", "last")
-                text_start, text_end = dataset.text_window_bounds(index, 5 if pool == "mean5" else 1)
+                text_start, text_end = dataset.text_window_bounds(index, 1 if pool == "last" else 5)
                 dates.append(np.datetime64(date))
                 weights.append(detail["weights"][sample])
                 contributions.append(detail["contributions"][sample])
@@ -52,6 +60,18 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
                               "pair_available": int(detail["pair_available"][sample, group_index]),
                               "pair_available_used": int(detail["pair_available_used"][sample, group_index]),
                               "weight": float(detail["weights"][sample, group_index])}
+                    if pool == "attention5":
+                        end = int(index) + dataset.seq_len
+                        window_dates = dataset.row_dates[end-5:end]
+                        for day, day_date in enumerate(window_dates):
+                            record[f"date_d{day+1}"] = str(day_date)
+                            record[f"age_d{day+1}"] = int(detail["row_ages"][day])
+                            record[f"present_d{day+1}"] = int(detail["daily_present"][sample, group_index, day])
+                            record[f"beta_d{day+1}"] = float(detail["temporal_weights"][sample, group_index, day])
+                            for key in range(5):
+                                record[f"attention_A_q{day+1}_k{key+1}"] = float(detail["attention"][sample, group_index, day, key])
+                            for horizon in range(args.pred_len):
+                                record[f"date_contribution_d{day+1}_h{horizon+1}"] = float(detail["daily_contributions"][sample, group_index, day, horizon])
                     for horizon in range(args.pred_len):
                         record[f"head_h{horizon + 1}"] = float(detail["heads"][sample, group_index, horizon])
                         record[f"contribution_h{horizon + 1}"] = float(detail["contributions"][sample, group_index, horizon])

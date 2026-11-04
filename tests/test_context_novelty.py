@@ -275,6 +275,7 @@ class ContextNoveltyTests(unittest.TestCase):
         frame = make_frame()
         cases = [(gate, "last") for gate in ("static", "context_novelty", "context_no_novelty", "context_price_only")]
         cases.append(("context_price_only", "mean5"))
+        cases.append(("context_price_only", "attention5"))
         for gate, pool in cases:
             with self.subTest(gate=gate, pool=pool), tempfile.TemporaryDirectory() as directory:
                 datasets = {flag: make_dataset(frame, flag) for flag in ("train", "val", "test")}
@@ -314,7 +315,7 @@ class ContextNoveltyTests(unittest.TestCase):
                 self.assertEqual(checkpoint["args"], args)
                 self.assertEqual(args["text_model_config"]["text_temporal_pool"], pool)
                 self.assertEqual(summary["text_temporal_pool"], pool)
-                if pool == "mean5":
+                if pool in ("mean5", "attention5"):
                     self.assertEqual(summary["window_evidence"], args["window_evidence"])
                     self.assertTrue((root / "window_evidence.json").is_file())
                 self.assertEqual(checkpoint["epoch"], 1)
@@ -348,7 +349,7 @@ class ContextNoveltyTests(unittest.TestCase):
                 for row in rows:
                     index = int(row["window_index"])
                     group = TEXT_GROUPS.index(row["group"])
-                    width = 5 if pool == "mean5" else 1
+                    width = 1 if pool == "last" else 5
                     text_window = datasets["val"][index][2][-width:, group]
                     count = int((np.abs(text_window.astype(np.float32)).sum(-1) >= 1e-6).sum())
                     self.assertEqual(int(row["available_dates"]), count)
@@ -362,6 +363,24 @@ class ContextNoveltyTests(unittest.TestCase):
                     for h in range(1, 4):
                         expected = 0.1 * float(row["weight"]) * int(row["present"]) * float(row[f"head_h{h}"])
                         self.assertAlmostEqual(float(row[f"contribution_h{h}"]), expected, places=6)
+                    if pool == "attention5":
+                        from forecasting_task.models.AttentionPool import attention5_config
+                        for source in (args, checkpoint, summary, args["text_model_config"]):
+                            self.assertEqual(source["attention_config"], attention5_config())
+                        end = index + datasets["val"].seq_len
+                        actual_dates = [row[f"date_d{d}"] for d in range(1, 6)]
+                        self.assertEqual(actual_dates, list(datasets["val"].row_dates[end-5:end]))
+                        self.assertEqual([int(row[f"age_d{d}"]) for d in range(1, 6)], [4, 3, 2, 1, 0])
+                        masks = np.array([int(row[f"present_d{d}"]) for d in range(1, 6)])
+                        np.testing.assert_array_equal(masks, np.abs(text_window.astype(np.float32)).sum(-1) >= 1e-6)
+                        matrix = np.array([[float(row[f"attention_A_q{i}_k{j}"]) for j in range(1, 6)] for i in range(1, 6)])
+                        beta = np.array([float(row[f"beta_d{d}"]) for d in range(1, 6)])
+                        np.testing.assert_allclose(matrix.sum(-1), masks, atol=1e-7)
+                        np.testing.assert_allclose(beta, matrix.sum(0)/max(count, 1), atol=1e-7)
+                        self.assertAlmostEqual(beta.sum(), int(count > 0), places=6)
+                        for h in range(1, 4):
+                            self.assertAlmostEqual(sum(float(row[f"date_contribution_d{d}_h{h}"]) for d in range(1, 6)),
+                                                   float(row[f"contribution_h{h}"]), places=6)
                 for name in diagnostic["plots"]:
                     self.assertTrue((root / name).read_bytes().startswith(b"\x89PNG"))
                 # Regenerate from the restored best state and require identical CSV.
