@@ -5,13 +5,15 @@ import json
 import time
 import subprocess
 from pathlib import Path
+from functools import partial
 
 import numpy as np
 import torch
 import yaml
 from forecasting_task.models.GroupText import (
     TextModel, TEXT_GROUPS, mlp_structure, validate_initial_group_weights,
-    validate_fixed_uniform_weights, build_text_model,
+    validate_fixed_uniform_weights, build_text_model, validate_price_context_lags,
+    price_context_metadata, DEFAULT_PRICE_CONTEXT_LAGS,
 )
 from forecasting_task.models.DLinear import Model as DLinear
 from forecasting_task.models.PatchTST import Model as PatchTST
@@ -71,6 +73,7 @@ def parse_args(argv=None):
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
     parser.add_argument("--group_gate", choices=["static", "context_novelty", "context_no_novelty", "context_price_only"], default=None,
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
+    parser.add_argument("--price_context_lags", type=int, nargs="+", default=list(DEFAULT_PRICE_CONTEXT_LAGS))
     parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
@@ -104,12 +107,20 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    try:
+        args.price_context_lags = validate_price_context_lags(args.price_context_lags, args.seq_len)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.group_gate != "context_price_only" and tuple(args.price_context_lags) != DEFAULT_PRICE_CONTEXT_LAGS:
+        parser.error("Nonstandard --price_context_lags are supported only for context_price_only")
+    for key, value in price_context_metadata(args.price_context_lags).items():
+        setattr(args, key, value)
     if args.group_weight_mode is None:
         args.group_weight_mode = "fixed_uniform" if args.group_gate else "learnable"
     if args.group_gate:
         if (args.model_type.lower() != "film" or args.text_weight != 0.1 or args.fusion_mode != "blend"
-                or args.group_weight_mode != "fixed_uniform" or args.seq_len < 6):
-            parser.error("--group_gate requires FiLM, alpha=0.1, blend, fixed_uniform and seq_len>=6")
+                or args.group_weight_mode != "fixed_uniform"):
+            parser.error("--group_gate requires FiLM, alpha=0.1, blend and fixed_uniform")
         if not args.code_commit:
             try:
                 args.code_commit = subprocess.check_output(
@@ -122,10 +133,13 @@ def parse_args(argv=None):
             parser.error("--code_commit must be a full hexadecimal Git SHA")
         from forecasting_task.data_provider.context_novelty import NOVELTY_POLICY
         args.novelty_policy = NOVELTY_POLICY.copy()
+        if tuple(args.price_context_lags) != DEFAULT_PRICE_CONTEXT_LAGS:
+            args.novelty_policy["price_context"] = "concat(X[-1]-X[-1-lag] in saved lag/OHLC order); normalized input OHLC only"
+            args.novelty_policy["price_context_lags"] = list(args.price_context_lags)
         args.fixed_alpha = 0.1
         args.text_weight_mode = "fixed"
-        args.gate_structure = ({"type": "Linear", "in_features": 18, "out_features": 5,
-                                "parameters": 95, "initialization": "zeros"}
+        args.gate_structure = ({"type": "Linear", "in_features": args.gate_input_size, "out_features": 5,
+                                "parameters": 5 * (args.gate_input_size + 1), "initialization": "zeros"}
                                if args.group_gate != "static" else None)
         args.sampling_policy = "independent_train_generator"
     if not 0 < args.text_weight < 1:
@@ -158,6 +172,8 @@ def parse_args(argv=None):
     }
     if args.group_gate:
         args.text_model_config["group_gate"] = args.group_gate
+        args.text_model_config["price_context_lags"] = list(args.price_context_lags)
+        args.text_model_config["seq_len"] = args.seq_len
         if args.group_gate != "static":
             args.group_weight_mode = args.group_gate
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
@@ -286,6 +302,8 @@ def main(argv=None):
     if args.group_gate:
         from forecasting_task.data_provider.context_novelty import get_context_novelty_dataloader
         loader_factory = get_context_novelty_dataloader
+        if args.group_gate == "context_price_only":
+            loader_factory = partial(loader_factory, min_seq_len=max(args.price_context_lags) + 1)
     train_dataset, train_dataloader = loader_factory(
         seq_len=args.seq_len,
         label_len=args.label_len,
@@ -317,6 +335,11 @@ def main(argv=None):
         batch_size=args.batch_size,
     )
     train_generator = _configure_gate_sampling(train_dataloader, args.seed) if args.group_gate else None
+    if args.group_gate == "context_price_only":
+        from forecasting_task.window_evidence import window_evidence
+        args.window_evidence = {"val": window_evidence(val_dataset), "test": window_evidence(test_dataset)}
+        with open(os.path.join(args.logdir, "window_evidence.json"), "x", encoding="utf-8") as handle:
+            json.dump(args.window_evidence, handle, indent=2)
     if args.model_type.lower() == "dlinear":
         model = DLinear(args)
     elif args.model_type.lower() == "patchtst":
@@ -494,6 +517,7 @@ def main(argv=None):
             if args.group_gate:
                 checkpoint.update(group_gate=args.group_gate, fixed_alpha=0.1, text_weight_mode="fixed",
                                   code_commit=args.code_commit, train_generator_state=train_generator.get_state())
+                checkpoint.update(price_context_metadata(args.price_context_lags))
 
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
@@ -611,6 +635,9 @@ def main(argv=None):
                        gate_structure=args.gate_structure, novelty_policy=args.novelty_policy,
                        sampling_policy=args.sampling_policy, validation_diagnostics=gate_diagnostics,
                        diagnostic_seconds=diagnostic_seconds)
+        summary.update(price_context_metadata(args.price_context_lags))
+    if args.group_gate == "context_price_only":
+        summary["window_evidence"] = args.window_evidence
 
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len

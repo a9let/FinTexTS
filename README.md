@@ -628,3 +628,144 @@ also printed. Tests cover pair-availability invariance with a nonzero gate,
 presence masking, zero gradients in the ten unused columns, matched initialization
 and batching, checkpoint/diagnostic restoration, a mocked 1+30 queue, statistical
 aggregation, mismatch exclusions, read-only analysis and validation-only selection.
+
+### Multiscale price context, last-date text
+
+Branch `experiment/context-price-multiscale` starts from `experiment/context-price-only`.
+`--price_context_lags` accepts a nonempty list of positive, unique integers smaller
+than `seq_len`. The default and fallback for old checkpoints is `1 5`. Custom
+lags are supported only with `--group_gate context_price_only`; other conditions
+explicitly reject them. The supplied order is preserved, with OHLC in the order
+`open, high, low, close` inside each lag. For normalized input prices `X`:
+
+```text
+price_context = concat(X[:, -1, :] - X[:, -1-lag, :] for lag in lags)
+gate_input = concat(price_context, zeros_5, zeros_5)
+weights = softmax(Linear(4*len(lags)+10, 5)(gate_input))
+present_g = float32_L1(last_date_embedding_g) >= 1e-6
+delta = sum_g weights_g * present_g * Linear_g(last_date_embedding_g)
+prediction = 0.9 * FiLM_prediction + 0.1 * (last_known_price + delta)
+```
+
+The new condition uses `--price_context_lags 1 2 5 10 20`: gate input size 30,
+155 gate parameters, compared with input size 18 and 95 parameters for `[1,5]`.
+Gate weights and bias start at zero, so initial group weights are 0.2. Gate
+construction preserves the RNG state regardless of its size; FiLM/head starting
+parameters, initial predictions and train batch order match at the same seed.
+Only last-date text enters the five independent Linear(384,3) heads. Head outputs
+are masked after Linear, without renormalizing weights over present groups.
+The anchor remains present even when all text is absent. No temporal text pooling
+is introduced in this branch.
+
+```mermaid
+flowchart LR
+    X["Normalized input OHLC: 64 rows"] --> F[FiLM]
+    X --> C["Last OHLC minus lagged OHLC: lags 1,2,5,10,20"]
+    C --> I["20 price features + 5 novelty zeros + 5 pair zeros"]
+    I --> G["Zero-initialized Linear 30 to 5 + softmax"]
+    T["Last input date: 5 separate embeddings of size 384"] --> H["5 independent Linear 384 to 3 heads"]
+    T --> M[Presence masks]
+    H --> D[Weighted sum of masked head outputs]
+    M --> D
+    G --> D
+    X --> L[Last known OHLC]
+    F --> O["0.9 FiLM + 0.1 last OHLC + 0.1 delta"]
+    L --> O
+    D --> O
+```
+
+FiLM, train-only StandardScaler, temporal splits, loss/metrics, missing-data
+processing, Adam lr=0.001 and best-validation-MSE checkpoint selection are
+unchanged. Settings: seq_len=64, label_len=16, pred_len=3, batch_size=32,
+max epochs=50, patience=10, fixed alpha=0.1 and anchored blend. Training starts
+from scratch. No learned weights are imported from the control.
+
+`args.yaml`, checkpoint and summary store `price_context_lags`,
+`price_feature_order`, `price_context_feature_order`, `gate_feature_order`, and
+`gate_input_size`. The text-model reconstruction configuration carries the lags
+and input length. Old configurations without lags reconstruct the original
+18-input gate. Validation CSV/plots still come from the best checkpoint; CSV
+columns `gate_feature_*` record every actual gate input in the saved order,
+alongside real and used novelty/pair availability, masks, group weights, signed
+contributions, lag list and gate size.
+
+For both validation and test, `window_evidence` stores SHA-256 fingerprints of
+normalized OHLC input windows, future targets, input-end dates and target dates,
+plus window counts/shapes. These are saved in args/checkpoint/summary and
+`window_evidence.json`. Fingerprinting consumes no random numbers and uses the
+same existing dataset windows.
+
+Inside the existing server Docker, from the code checkout:
+
+```bash
+bash -n run_context_price_multiscale_30.sh
+bash run_context_price_multiscale_30.sh
+```
+
+If `.git` is unavailable in Docker, set `CODE_COMMIT` to the full code commit SHA
+before running the dispatcher. It resolves CODE from its own location and sets
+PYTHONPATH to CODE and CODE/forecasting_task. One NVDA seed=7 one-epoch check runs
+first, followed by exactly 30 main runs: AAPL ABBV ABT ACN ADBE ADI AMAT AMD AMGN
+AMZN, each with seeds 7/17/27. All 31 runs use the five new lags. Results:
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_multiscale_10_v1/
+  checks/context_price_only/NVDA/seed7/{train.log,output/}
+  full/context_price_only/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+The dispatcher checks CUDA and input files, uses OMP/MKL threads=2, records SHA,
+script copy and ticker list, refuses existing run destinations, stops on failure
+with the log tail, and checks nonempty summary/checkpoint before OK. The check
+does not increment main progress; completion is `ALL 30 RUNS COMPLETED`.
+
+After the server runs finish, analyze saved metrics and replay windows on CPU:
+
+```bash
+python analyze_context_price_multiscale.py
+```
+
+The primary comparison is multiscale versus the same ten tickers/seeds from
+`context_price_only_10_v1/full/context_price_only/` (last-date text, lags `[1,5]`).
+`film_compare_50ep_v1/full/baseline/` is an additional architecture reference.
+The analysis checks configuration, causal preprocessing and sampling policies,
+train-only scaler, normalized price windows and targets. Different gate lags,
+input dimensions and gate parameter counts are expected differences. It creates
+no model, invokes no training entry point and preserves all training artifacts.
+
+`window_verification` is printed and exported for every run and as counts:
+
+- `full`: saved validation/test fingerprints, normalized test arrays and archived
+  validation dates all agree with replayed data.
+- `partial`: some historical evidence is missing; replayed targets alone do not
+  establish equality with the historical validation targets. Each verified part
+  and each limitation are reported separately.
+- `mismatch`: an available fingerprint, array or date contradicts replay.
+- `not_checked`: an earlier configuration/scaler check failed.
+
+New multiscale runs require full evidence. Historical controls without validation
+fingerprints require matching normalized test inputs/targets and archived
+validation dates; any validation-based choice is explicitly provisional until
+historical validation values can be verified. Contradictions or missing required
+control evidence block selection and make the CLI exit unsuccessfully after
+saving the report. Incompatible baseline runs are excluded from relative and
+paired comparisons. OHLC fingerprints do not certify historical embedding values.
+Baseline architecture differences are also listed in `limitations.csv`.
+
+Reports go to the new root's `diagnostics/comparison_10/`; existing reports are
+never overwritten (`--output_dir` selects a new destination). Other path options
+are `--results_root`, `--control_root`, `--baseline_root`, and `--data_root`.
+CSV tables include per-run validation MSE/test MSE/test MAE, three-seed ticker
+means, ten-ticker seed means, mean/sample std (ddof=1) between seed means,
+relative changes `100*(left-right)/right` (negative means lower error), paired
+stock differences/wins/ties, verification evidence and issues. Missing metrics
+remain missing; averages require the complete cohort. `selection.json` compares
+only multiscale/control validation MSE, excludes baseline from the primary choice,
+and never uses test errors to select a variant.
+
+Synthetic CPU tests cover explicit indices and feature order, invalid lags,
+nonzero-gate legacy `[1,5]` equivalence, zero initialization, gate gradients,
+unchanged FiLM/head initialization and batch order, last-date-only text,
+best-checkpoint restoration and variable-width diagnostics, window/scaler/target
+mismatches, full versus partial evidence, validation-only selection and the
+mocked 1-check + 30-main queue. No real training is part of these checks.

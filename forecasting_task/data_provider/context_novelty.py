@@ -50,9 +50,9 @@ def causal_novelty(embeddings):
 class ContextNoveltyDataset(Dataset):
     """Append last-input-day novelty/pair features to the original six fields."""
 
-    def __init__(self, base):
-        if base.seq_len < 6 or tuple(base.used_col_prefixes) != TEXT_GROUPS:
-            raise ValueError("group_gate requires seq_len>=6 and all five ordered groups")
+    def __init__(self, base, min_seq_len=6):
+        if base.seq_len < min_seq_len or tuple(base.used_col_prefixes) != TEXT_GROUPS:
+            raise ValueError(f"group_gate requires seq_len>={min_seq_len} and all five ordered groups")
         self.base = base
         self.seq_len, self.label_len, self.pred_len = base.seq_len, base.label_len, base.pred_len
         self.scaler = base.scaler
@@ -103,7 +103,7 @@ class ContextNoveltyDataset(Dataset):
         return self.base.inverse_transform(values)
 
 
-def get_context_novelty_dataloader(batch_size, **kwargs):
-    dataset = ContextNoveltyDataset(Dataset_Custom(**kwargs))
+def get_context_novelty_dataloader(batch_size, min_seq_len=6, **kwargs):
+    dataset = ContextNoveltyDataset(Dataset_Custom(**kwargs), min_seq_len=min_seq_len)
     train = kwargs["flag"] == "train"
     return dataset, DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=1, drop_last=train)

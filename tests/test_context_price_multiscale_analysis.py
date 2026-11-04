@@ -1,0 +1,214 @@
+"""Saved target-window alignment, report statistics and primary validation selection."""
+
+import contextlib
+import csv
+import hashlib
+import io
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
+import torch
+
+import analyze_context_price_multiscale as analysis
+from forecasting_task.window_evidence import window_evidence, check_saved_test_windows
+
+
+class WindowDataset:
+    seq_len, pred_len = 64, 3
+    row_dates = pd.bdate_range("2022-01-03", periods=72).strftime("%Y-%m-%d").to_numpy()
+
+    def __len__(self):
+        return 4
+
+    def __getitem__(self, index):
+        prices = np.arange(72 * 4, dtype=np.float32).reshape(72, 4) / 100
+        return prices[index:index + 64], prices[index + 48:index + 67]
+
+    def window_end_date(self, index):
+        return str(self.row_dates[index + 63])
+
+
+class MultiscaleAnalysisTests(unittest.TestCase):
+    def fixture(self, directory):
+        roots = [Path(directory) / name for name in ("multiscale", "control", "baseline")]
+        dataset = WindowDataset()
+        signatures = {split: window_evidence(dataset) for split in ("val", "test")}
+        scalers = {split: {"mean": np.arange(4, dtype=float), "scale": np.ones(4), "var": np.ones(4)} for split in signatures}
+        for variant, root in zip(analysis.VARIANTS, roots):
+            gate = "context_price_only" if variant in ("multiscale", "control") else variant
+            folder = "baseline" if variant == "original_baseline" else gate
+            for ticker in analysis.TICKERS:
+                for seed_index, seed in enumerate(analysis.SEEDS):
+                    output = root / "full" / folder / ticker / f"seed{seed}" / "output"
+                    output.mkdir(parents=True)
+                    args = {**analysis.COMMON, "model_type": "FiLM", "seed": seed, "data_path": ticker + ".parquet",
+                            "task_name": "short_term_forecast", "e_layers": 2, "output_attention": False,
+                            "enc_in": 4, "dec_in": 4, "c_out": 4, "group_gate": gate, "group_weight_mode": gate,
+                            "fixed_alpha": 0.1, "text_weight_mode": "fixed", "text_weight": 0.1,
+                            "text_num_layers": 1, "used_col_prefixes": analysis.GROUPS, "fusion_mode": "blend",
+                            "text_model_config": {"group_gate": gate}, "novelty_policy": {"previous": "earlier present row"},
+                            "sampling_policy": "independent_train_generator", "gate_structure": {"parameters": 95},
+                            "text_mlp_structure": [{"type": "Linear", "in_features": 384, "out_features": 3}]}
+                    val = {"multiscale": 0.3, "control": 0.2, "original_baseline": 0.1}[variant] + seed_index * 0.05
+                    summary = {"model": "FiLM", "seed": seed, "data_path": args["data_path"], "best_epoch": 1,
+                               "group_gate": gate, "fixed_alpha": 0.1, "text_weight_mode": "fixed",
+                               "best_val_mse": val, "best_test_mse": 0.1 if variant == "multiscale" else 0.3, "best_test_mae": 0.05}
+                    layout = analysis.price_context_metadata(analysis.MULTISCALE_LAGS if variant == "multiscale" else analysis.CONTROL_LAGS)
+                    gate_structure = {"type": "Linear", "in_features": layout["gate_input_size"], "out_features": 5,
+                                      "parameters": 5 * (layout["gate_input_size"] + 1), "initialization": "zeros"}
+                    args["gate_structure"] = summary["gate_structure"] = gate_structure
+                    if variant == "multiscale":
+                        args.update(layout, window_evidence=signatures)
+                        summary.update(layout, window_evidence=signatures)
+                        args["text_model_config"].update(price_context_lags=analysis.MULTISCALE_LAGS, seq_len=64)
+                        args["novelty_policy"].update(price_context="multiscale", price_context_lags=analysis.MULTISCALE_LAGS)
+                    (output / "summary.json").write_text(json.dumps(summary))
+                    torch.save({"args": args, "epoch": 1, "scaler_mean": [0., 1., 2., 3.],
+                                "scaler_scale": [1.] * 4, "scaler_var": [1.] * 4}, output / "best_checkpoint.pt")
+                    x = torch.from_numpy(np.stack([dataset[i][0] for i in range(len(dataset))]))
+                    y = torch.from_numpy(np.stack([dataset[i][1][-3:] for i in range(len(dataset))]))
+                    torch.save({"inputs": x, "ground_truths": y, "inputs_inv": x + 1000}, output / "test_io.pt")
+                    if variant != "original_baseline":
+                        with (output / "validation_group_diagnostics.csv").open("w", newline="") as handle:
+                            writer = csv.DictWriter(handle, fieldnames=["window_index", "input_end_date", "group"])
+                            writer.writeheader()
+                            for index in range(len(dataset)):
+                                for group in analysis.GROUPS:
+                                    writer.writerow({"window_index": index, "input_end_date": dataset.window_end_date(index), "group": group})
+        return roots, signatures, scalers
+
+    def analyze(self, roots, signatures, scalers):
+        with patch.object(analysis, "replay_windows", return_value=(signatures, scalers)), contextlib.redirect_stdout(io.StringIO()):
+            return analysis.analyze(*roots)
+
+    def test_three_variants_relative_statistics_read_only_and_primary_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            roots, signatures, scalers = self.fixture(directory)
+            original = {p: hashlib.sha256(p.read_bytes()).hexdigest() for root in roots for p in root.rglob("*.*")}
+            tables, selection = self.analyze(roots, signatures, scalers)
+            self.assertEqual(len(tables["per_run"]), 90)
+            self.assertEqual(len(tables["by_seed"]), 9)
+            self.assertEqual(len(tables["paired_by_ticker"]), 90)
+            self.assertEqual(selection["selected_variants"], ["control"])
+            self.assertFalse(selection["test_used_for_selection"])
+            self.assertTrue(selection["provisional"])
+            self.assertEqual(len(tables["limitations"]), 4)
+            # The benchmark has lower val error, but the primary choice is multiscale vs control.
+            self.assertEqual(set(selection["validation_scores"]), {"multiscale", "control"})
+            self.assertEqual(selection["selection_status"], "validation_only_partial_historical_evidence")
+            full = [r for r in tables["per_run"] if r["window_verification"] == "full"]
+            partial = [r for r in tables["per_run"] if r["window_verification"] == "partial"]
+            self.assertEqual(len(full), 30)
+            self.assertEqual(len(partial), 60)
+            self.assertEqual({r["variant"] for r in full}, {"multiscale"})
+            self.assertTrue(all(not r["val_fingerprint_verified"] for r in partial))
+            self.assertTrue(all(r["saved_test_arrays_verified"] for r in partial))
+            stat = next(r for r in tables["across_seeds"] if r["variant"] == "multiscale" and r["metric"] == "val_mse")
+            self.assertAlmostEqual(stat["mean"], 0.35)
+            self.assertAlmostEqual(stat["sample_std"], 0.05)
+            relative = next(r for r in tables["relative_by_seed"] if r["left"] == "multiscale" and r["right"] == "control" and r["metric"] == "val_mse" and r["seed"] == "across_seeds")
+            self.assertAlmostEqual(relative["relative_change_of_overall_means_pct"], 40.)
+            for path, signature in original.items():
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), signature)
+            with self.assertRaises(FileExistsError):
+                self.analyze(roots, signatures, scalers)
+
+    def test_mismatches_are_reported_and_primary_selection_is_blocked(self):
+        for change in ("targets", "fingerprints", "dates", "scaler", "pool", "lags", "feature_order"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                roots, signatures, scalers = self.fixture(directory)
+                output = roots[0] / "full/context_price_only/AAPL/seed7/output"
+                if change == "targets":
+                    path = roots[1] / "full/context_price_only/AAPL/seed7/output/test_io.pt"
+                    payload = torch.load(path, weights_only=True)
+                    payload["ground_truths"] += 1
+                    torch.save(payload, path)
+                elif change == "dates":
+                    path = output / "validation_group_diagnostics.csv"
+                    path.write_text(path.read_text().replace(WindowDataset().window_end_date(0), "1900-01-01"))
+                else:
+                    path = output / "best_checkpoint.pt"
+                    payload = torch.load(path, weights_only=True)
+                    if change == "fingerprints":
+                        payload["args"]["window_evidence"]["val"]["targets_sha256"] = "bad"
+                    elif change == "scaler":
+                        payload["scaler_mean"][0] = 50
+                    elif change == "pool":
+                        payload["args"]["text_temporal_pool"] = "mean5"
+                    elif change == "lags":
+                        payload["args"]["text_model_config"]["price_context_lags"] = [20, 10, 5, 2, 1]
+                    else:
+                        payload["args"]["gate_feature_order"].reverse()
+                    torch.save(payload, path)
+                tables, selection = self.analyze(roots, signatures, scalers)
+                self.assertEqual(selection["selection_status"], "blocked_primary_comparability")
+                self.assertEqual(selection["selected_variants"], [])
+                failed = [r for r in tables["per_run"] if not r["comparable"]]
+                self.assertEqual(len(failed), 1)
+                expected = "mismatch" if change in ("targets", "fingerprints", "dates") else "not_checked"
+                self.assertEqual(failed[0]["window_verification"], expected)
+                self.assertTrue(tables["issues"])
+                self.assertTrue((roots[0] / "diagnostics/comparison_10/window_verification_summary.csv").is_file())
+
+    def test_actual_dataset_replay_matches_normalized_future_targets(self):
+        dates = [*pd.date_range("2021-01-01", periods=80), *pd.date_range("2022-01-01", periods=10),
+                 *pd.date_range("2023-01-01", periods=10)]
+        columns = {"date": [d.strftime("%Y-%m-%d") for d in dates], "ticker": ["AAPL"] * len(dates)}
+        for index, channel in enumerate(("open", "high", "low", "close")):
+            columns[channel] = np.arange(len(dates), dtype=float) + index
+        for group in analysis.GROUPS:
+            for dim in range(384):
+                columns[f"{group}_emb{dim}"] = np.zeros(len(dates), np.float32)
+        frame = pd.DataFrame(columns)
+        with patch("pandas.read_parquet", return_value=frame):
+            signatures, scalers = analysis.replay_windows("AAPL", analysis.COMMON, Path("unused"))
+        self.assertEqual(signatures["val"]["windows"], 8)
+        self.assertEqual(signatures["test"]["windows"], 8)
+        self.assertEqual(signatures["val"]["first_input_end_date"], frame.date.iloc[79])
+        np.testing.assert_allclose(scalers["val"]["mean"], np.arange(4) + 39.5)
+        self.assertNotEqual(signatures["val"]["targets_sha256"], signatures["test"]["targets_sha256"])
+
+    def test_historical_missing_dates_blocks_primary_and_full_evidence_removes_provisional_flag(self):
+        for complete in (False, True):
+            with self.subTest(complete=complete), tempfile.TemporaryDirectory() as directory:
+                roots, signatures, scalers = self.fixture(directory)
+                outputs = list((roots[1] / "full").glob("*/*/seed*/output"))
+                self.assertEqual(len(outputs), 30)
+                if complete:
+                    for output in outputs:
+                        path = output / "best_checkpoint.pt"
+                        payload = torch.load(path, weights_only=True)
+                        payload["args"]["window_evidence"] = signatures
+                        torch.save(payload, path)
+                        path = output / "summary.json"
+                        summary = json.loads(path.read_text())
+                        summary["window_evidence"] = signatures
+                        path.write_text(json.dumps(summary))
+                else:
+                    # Keep all inputs/targets but remove the archived validation-date evidence.
+                    path = roots[1] / "full/context_price_only/AAPL/seed7/output/validation_group_diagnostics.csv"
+                    path.rename(path.with_suffix(".backup"))
+                tables, selection = self.analyze(roots, signatures, scalers)
+                self.assertEqual(selection["selected_variants"], ["control"] if complete else [])
+                self.assertEqual(selection["selection_status"], "validation_only_full" if complete else "blocked_primary_comparability")
+                self.assertFalse(selection["provisional"])
+                row = next(r for r in tables["per_run"] if r["variant"] == "control" and r["ticker"] == "AAPL" and r["seed"] == 7)
+                self.assertEqual(row["window_verification"], "full" if complete else "partial")
+                self.assertEqual(row["comparable"], complete)
+
+    def test_cli_exits_after_saving_a_blocked_comparison(self):
+        with patch.object(analysis, "analyze", return_value=({}, {"selection_status": "blocked_primary_comparability"})), self.assertRaises(SystemExit):
+            analysis.cli([])
+
+    def test_normalized_io_required_and_inverse_arrays_are_not_used(self):
+        expected = window_evidence(WindowDataset())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test_io.pt"
+            torch.save({"inputs_inv": torch.ones(4, 64, 4), "ground_truths_inv": torch.ones(4, 3, 4)}, path)
+            with self.assertRaisesRegex(ValueError, "missing normalized"):
+                check_saved_test_windows(path, expected)

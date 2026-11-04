@@ -1,6 +1,7 @@
 """Independent group MLPs and learnable price/text fusion."""
 
 import math
+from numbers import Integral
 
 import torch
 from torch import nn
@@ -8,6 +9,38 @@ from torch import nn
 
 TEXT_GROUPS = ("macro", "sector", "targetCompany", "relatedCompany", "filing")
 EMBEDDING_SIZE = 384
+OHLC_FEATURES = ("open", "high", "low", "close")
+DEFAULT_PRICE_CONTEXT_LAGS = (1, 5)
+
+
+def validate_price_context_lags(values=None, seq_len=None):
+    try:
+        lags = list(DEFAULT_PRICE_CONTEXT_LAGS if values is None else values)
+    except TypeError as error:
+        raise ValueError("price_context_lags must be a list of positive integers") from error
+    if not lags or any(isinstance(lag, bool) or not isinstance(lag, Integral) or lag <= 0 for lag in lags):
+        raise ValueError("price_context_lags must be a nonempty list of positive integers")
+    if len(set(lags)) != len(lags):
+        raise ValueError("price_context_lags must be unique")
+    if seq_len is not None and max(lags) >= seq_len:
+        raise ValueError("max(price_context_lags) must be less than seq_len")
+    return [int(lag) for lag in lags]
+
+
+def price_context_metadata(lags=None):
+    lags = validate_price_context_lags(lags)
+    price_order = [f"price_delta_lag{lag}_{channel}" for lag in lags for channel in OHLC_FEATURES]
+    gate_order = price_order + [f"novelty_used_{g}" for g in TEXT_GROUPS] + [f"pair_available_used_{g}" for g in TEXT_GROUPS]
+    return {"price_context_lags": lags, "price_feature_order": list(OHLC_FEATURES),
+            "price_context_feature_order": price_order, "gate_feature_order": gate_order,
+            "gate_input_size": len(gate_order)}
+
+
+def build_price_context(price_window, lags=None):
+    if price_window.ndim != 3 or price_window.shape[-1] != 4:
+        raise ValueError("Expected normalized input price_window [batch, rows, 4]")
+    lags = validate_price_context_lags(lags, price_window.shape[1])
+    return torch.cat([price_window[:, -1] - price_window[:, -1-lag] for lag in lags], dim=-1)
 
 
 def validate_initial_group_weights(values, num_groups):
@@ -182,7 +215,7 @@ class ContextNoveltyTextModel(nn.Module):
 
     def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
                  initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
-                 group_gate="static"):
+                 group_gate="static", price_context_lags=None, seq_len=None):
         super().__init__()
         if group_gate not in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
             raise ValueError("Unknown group_gate condition")
@@ -190,6 +223,12 @@ class ContextNoveltyTextModel(nn.Module):
             raise ValueError("group_gate requires five ordered groups and one linear layer")
         if initial_text_weight != 0.1 or fusion_mode != "blend":
             raise ValueError("group_gate requires fixed alpha=0.1 and anchored blend")
+        lags = validate_price_context_lags(price_context_lags, seq_len)
+        if group_gate != "context_price_only" and tuple(lags) != DEFAULT_PRICE_CONTEXT_LAGS:
+            raise ValueError("Nonstandard price_context_lags require context_price_only")
+        self.price_context_lags = tuple(lags)
+        self.context_metadata = price_context_metadata(lags)
+        self.gate_input_size = self.context_metadata["gate_input_size"]
         validate_fixed_uniform_weights(initial_group_weights, 5)
         self.used_col_prefixes, self.pred_len, self.group_gate = TEXT_GROUPS, pred_len, group_gate
         self.group_mlps = nn.ModuleDict({
@@ -200,7 +239,7 @@ class ContextNoveltyTextModel(nn.Module):
         if group_gate != "static":
             # Linear's default initialization must not advance other RNG streams.
             with torch.random.fork_rng(devices=[]):
-                self.gate = nn.Linear(18, 5)
+                self.gate = nn.Linear(self.gate_input_size, 5)
             nn.init.zeros_(self.gate.weight)
             nn.init.zeros_(self.gate.bias)
 
@@ -214,6 +253,7 @@ class ContextNoveltyTextModel(nn.Module):
 
     def fusion_state(self):
         state = {"group_gate": self.group_gate, "text_weight_mode": "fixed", "fixed_alpha": 0.1,
+                 "price_context_lags": list(self.price_context_lags), "gate_input_size": self.gate_input_size,
                  "text_alpha": self.get_alpha().detach().cpu().item()}
         if self.group_gate == "static":
             state["fixed_group_coefficients"] = self.fixed_group_coefficients()
@@ -227,12 +267,13 @@ class ContextNoveltyTextModel(nn.Module):
         if (price_output.ndim != 3 or price_output.shape != (batch, self.pred_len, 4)
                 or last_price.shape != (batch, 4)):
             raise ValueError("Expected OHLC price output [batch,pred_len,4] and last_price [batch,4]")
-        if price_window.ndim != 3 or price_window.shape[0] != batch or price_window.shape[1] < 6 or price_window.shape[2] != 4:
+        if price_window.ndim != 3 or price_window.shape[0] != batch or price_window.shape[2] != 4:
+            raise ValueError("Price context requires input OHLC rows [batch, rows, 4]")
+        if self.price_context_lags == DEFAULT_PRICE_CONTEXT_LAGS and price_window.shape[1] < 6:
             raise ValueError("Price context requires at least six input OHLC rows")
         if novelty.shape != (batch, 5) or pair_available.shape != (batch, 5):
             raise ValueError("Expected novelty and pair_available [batch,5]")
-        context = torch.cat((price_window[:, -1] - price_window[:, -2],
-                             price_window[:, -1] - price_window[:, -6]), dim=-1)
+        context = build_price_context(price_window, self.price_context_lags)
         novelty_used = torch.zeros_like(novelty) if self.group_gate in ("context_no_novelty", "context_price_only") else novelty
         pair_available_used = torch.zeros_like(pair_available) if self.group_gate == "context_price_only" else pair_available
         features = torch.cat((context, novelty_used, pair_available_used), dim=-1)

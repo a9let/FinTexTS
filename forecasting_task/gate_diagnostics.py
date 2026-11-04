@@ -1,6 +1,7 @@
 """Validation-only window/group diagnostics for the selected best checkpoint."""
 
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -41,12 +42,16 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
                 contributions.append(detail["contributions"][sample])
                 for group_index, group in enumerate(TEXT_GROUPS):
                     record = {"window_index": index, "input_end_date": date, "group": group,
+                              "price_context_lags": json.dumps(list(text_model.price_context_lags)),
+                              "gate_input_size": text_model.gate_input_size,
                               "present": int(detail["present"][sample, group_index]),
                               "novelty": float(detail["novelty"][sample, group_index]),
                               "novelty_used": float(detail["novelty_used"][sample, group_index]),
                               "pair_available": int(detail["pair_available"][sample, group_index]),
                               "pair_available_used": int(detail["pair_available_used"][sample, group_index]),
                               "weight": float(detail["weights"][sample, group_index])}
+                    for feature, value in zip(text_model.context_metadata["gate_feature_order"], detail["features"][sample]):
+                        record["gate_feature_" + feature] = float(value)
                     for horizon in range(args.pred_len):
                         record[f"head_h{horizon + 1}"] = float(detail["heads"][sample, group_index, horizon])
                         record[f"contribution_h{horizon + 1}"] = float(detail["contributions"][sample, group_index, horizon])
