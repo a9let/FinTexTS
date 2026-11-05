@@ -899,3 +899,71 @@ relative changes `100*(left-right)/right` (negative means lower error), verifica
 details and issues. Validation MSE, test MSE and test MAE remain separate; missing
 metrics are not invented. Only attention5/mean5 validation MSE selects the primary
 variant in `selection.json`; test errors and extra references never select it.
+
+### Inspecting attention5 training curves and temporal weights
+
+`analyze_attention5_behavior.py` diagnoses the **completed** attention5 and mean5
+experiments without loading a model or starting training. Inside the existing
+Docker, from the code checkout:
+
+```bash
+python analyze_attention5_behavior.py
+```
+
+The default base directory is `/auto/datasets/kondyurin/FinTexTS/runs`. The script
+requires the same ten tickers (AAPL ABBV ABT ACN ADBE ADI AMAT AMD AMGN AMZN) and
+seeds 7/17/27 under `context_price_attention5_10_v1` and
+`context_price_mean5_10_v1`. It reads only args.yaml, summary.json, history.jsonl
+and validation_group_diagnostics.csv. It checks unique/nonempty artifacts,
+configuration agreement, validation fingerprints, dates/order and available-date
+counts. Selected best epoch must match the first validation-MSE minimum in the
+history; diagnostic metadata must refer to best_checkpoint.pt and agree with its
+reported validation error. Checkpoint tensors, raw data and test outputs are not
+read, so these checks establish saved-artifact consistency rather than an
+independent replay of model inference.
+
+Reports default to
+`context_price_attention5_10_v1/diagnostics/attention_behavior/`. Existing report
+directories are rejected; `--output_dir` selects a different new directory and
+`--runs_root` overrides the common input base. Training artifacts are preserved.
+
+- Thirty `learning_{ticker}_seed{seed}.png` figures place attention5 and mean5
+  side by side, with train/validation MSE and the selected best epoch marked.
+- `learning_aggregate_seed{all,7,17,27}.png` shows arithmetic means and a separate
+  panel with the number of remaining runs **at every epoch**. Available-run
+  curves and same-epoch paired-cohort curves are both shown. Even the paired
+  cohort can change over time; `learning_curves.csv` records exact membership
+  alongside counts and means. A late mean is not treated as the same cohort as
+  an early mean.
+- `best_epochs.png` and `best_epoch_distribution.csv` describe selected epochs;
+  the CSV separates seeds. `run_summary.csv` compares each run's last ten epochs
+  as two consecutive blocks of five, saving their actual epoch boundaries,
+  train/validation means, after-minus-before differences and relative changes.
+  Runs shorter than ten epochs have undefined block changes and are counted
+  explicitly in `block_changes_by_seed.csv`. These trajectories do not establish
+  overfitting from final metrics alone.
+- `weights_per_window.csv`, `weight_quantiles.csv`, `window_counts.csv` and
+  `weights_by_run.csv` report best-validation beta by seed, group and number of
+  present dates N. Metrics are `sum_present |beta-1/N|`, max beta,
+  `1/sum(beta^2)` and effective dates/N. Empty windows are counted separately and
+  have no defined concentration metrics. For N=1, beta=1 is forced and is never
+  labeled evidence of selectivity. Quantiles and plots compare equal N only.
+- `age_weights.csv` and `beta_age_seed*.png` give weights for row ages 4/3/2/1/0,
+  including availability counts, all-window means, conditional-on-present
+  means/quantiles and the uniform reference. `beta_metrics_seed*.png` shows
+  median, 5–95% range and mean for each group/N, against uniform values.
+
+Absent dates must have **exactly zero** beta; nonempty beta must sum to one within
+absolute tolerance 1e-6. Invalid coefficients stop analysis before report creation;
+they are not normalized or silently repaired. Window distributions pool windows
+within each seed/group/N; all-seed distributions pool those windows as well.
+`weights_by_run.csv` permits reaggregation with equal ticker weights if needed.
+
+Mean5's saved CSV contains counts/bounds rather than individual daily masks or
+beta. The uniform reference therefore uses 1/N on the **same attention5 daily
+mask**, while mean5 counts/bounds and saved OHLC window fingerprints are checked
+for agreement. This does not independently verify historical embedding values or
+mean5's individual daily masks. `verification.csv` and `interpretation.json`
+record the checks and interpretation limits. Synthetic tests exercise explicit
+beta arithmetic, empty/single-date windows, invalid weights, block boundaries,
+changing cohorts, matched saved-run inventory, read-only reporting and all PNGs.
