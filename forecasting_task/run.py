@@ -67,7 +67,7 @@ def parse_args(argv=None):
     parser.add_argument("--text_hidden_size", type=int, default=64)
     parser.add_argument("--text_num_layers", type=int, default=1)
     parser.add_argument("--text_temporal_pool", choices=["last", "mean5", "attention5"], default="last")
-    parser.add_argument("--text_history_mode", choices=["last", "history", "difference"], default="last")
+    parser.add_argument("--text_history_mode", choices=["last", "history", "difference", "uniform_history"], default="last")
     parser.add_argument("--text_weight", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
@@ -108,7 +108,7 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.text_history_mode != "last":
         if args.group_gate != "context_price_only" or args.text_temporal_pool != "last" or "fnspid" in args.data_path:
-            parser.error("history/difference require context_price_only, text_temporal_pool=last and no forward fill")
+            parser.error("History modes require context_price_only, text_temporal_pool=last and no forward fill")
     if args.text_temporal_pool in ("mean5", "attention5"):
         if args.group_gate != "context_price_only" or args.seq_len < 5 or "fnspid" in args.data_path:
             parser.error("mean5/attention5 require context_price_only, seq_len>=5 and data without forward fill")
@@ -178,6 +178,8 @@ def parse_args(argv=None):
                                     "head": {"type": "Linear", "in_features": 384, "out_features": args.pred_len,
                                              "bias": False, "initialization": "zeros", "groups": list(TEXT_GROUPS)},
                                     "additional_parameters": len(TEXT_GROUPS)*384*args.pred_len}
+        if args.text_history_mode == "uniform_history":
+            args.text_history_config.update(weighting="uniform_present", tau=None)
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
     args.enc_in = 4
     args.dec_in = 4

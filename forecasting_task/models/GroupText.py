@@ -200,7 +200,7 @@ def pool_text_window(embeddings, mode="last"):
     return pooled, counts > 0, counts
 
 
-def similar_text_history(embeddings):
+def similar_text_history(embeddings, *, uniform=False):
     """Current row queries exactly four preceding rows of the same group."""
     if embeddings.ndim != 4 or embeddings.shape[1] < 5 or embeddings.shape[2:] != (5, EMBEDDING_SIZE):
         raise ValueError("Text history requires [batch, rows>=5, 5, 384]")
@@ -214,6 +214,8 @@ def similar_text_history(embeddings):
     kernel = torch.exp(-(1-cosine)/.1)*eligible.to(cosine.dtype)
     denominator = kernel.sum(1, keepdim=True)
     weights = kernel/denominator.clamp_min(torch.finfo(kernel.dtype).tiny)
+    if uniform:
+        weights = eligible.to(kernel.dtype)/eligible.sum(1, keepdim=True).clamp_min(1)
     values = torch.where(eligible[..., None], previous, torch.zeros_like(previous))
     mean = (weights[..., None]*values).sum(1)
     rho = kernel.max(1).values
@@ -240,9 +242,9 @@ class ContextNoveltyTextModel(nn.Module):
             raise ValueError("mean5/attention5 are supported only with context_price_only")
         if attention_config is not None and (text_temporal_pool != "attention5" or attention_config != attention5_config()):
             raise ValueError("Saved attention configuration does not match attention5 architecture")
-        if (text_history_mode not in ("last", "history", "difference")
+        if (text_history_mode not in ("last", "history", "difference", "uniform_history")
                 or (text_history_mode != "last" and (group_gate != "context_price_only" or text_temporal_pool != "last"))):
-            raise ValueError("history/difference require context_price_only and last-date base embeddings")
+            raise ValueError("History modes require context_price_only and last-date base embeddings")
         validate_fixed_uniform_weights(initial_group_weights, 5)
         self.used_col_prefixes, self.pred_len, self.group_gate = TEXT_GROUPS, pred_len, group_gate
         self.text_temporal_pool = text_temporal_pool
@@ -317,8 +319,8 @@ class ContextNoveltyTextModel(nn.Module):
                              for index, group in enumerate(TEXT_GROUPS)], dim=1)
         history_details = {}
         if self.history_heads is not None:
-            mean, rho, history_details = similar_text_history(text_window)
-            history_input = mean if self.text_history_mode == "history" else embeddings-rho[..., None]*mean
+            mean, rho, history_details = similar_text_history(text_window, uniform=self.text_history_mode == "uniform_history")
+            history_input = mean if self.text_history_mode in ("history", "uniform_history") else embeddings-rho[..., None]*mean
             extra = torch.stack([self.history_heads[group](history_input[:, index])
                                  for index, group in enumerate(TEXT_GROUPS)], dim=1)
             history_details.update(history_mean=mean, history_rho=rho, history_input=history_input,
