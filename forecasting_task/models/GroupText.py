@@ -200,12 +200,34 @@ def pool_text_window(embeddings, mode="last"):
     return pooled, counts > 0, counts
 
 
+def similar_text_history(embeddings):
+    """Current row queries exactly four preceding rows of the same group."""
+    if embeddings.ndim != 4 or embeddings.shape[1] < 5 or embeddings.shape[2:] != (5, EMBEDDING_SIZE):
+        raise ValueError("Text history requires [batch, rows>=5, 5, 384]")
+    current, previous = embeddings[:, -1], embeddings[:, -5:-1]
+    current_present = current.float().abs().sum(-1) >= 1e-6
+    previous_present = previous.float().abs().sum(-1) >= 1e-6
+    current_unit = torch.nn.functional.normalize(current.float(), dim=-1, eps=1e-12)
+    previous_unit = torch.nn.functional.normalize(previous.float(), dim=-1, eps=1e-12)
+    cosine = (previous_unit*current_unit[:, None]).sum(-1).clamp(-1, 1)
+    eligible = previous_present & current_present[:, None]
+    kernel = torch.exp(-(1-cosine)/.1)*eligible.to(cosine.dtype)
+    denominator = kernel.sum(1, keepdim=True)
+    weights = kernel/denominator.clamp_min(torch.finfo(kernel.dtype).tiny)
+    values = torch.where(eligible[..., None], previous, torch.zeros_like(previous))
+    mean = (weights[..., None]*values).sum(1)
+    rho = kernel.max(1).values
+    return mean, rho, {"history_kernel": kernel, "history_weights": weights,
+                       "history_present": previous_present, "history_count": eligible.sum(1)}
+
+
 class ContextNoveltyTextModel(nn.Module):
     """Fixed-alpha anchored fusion with uniform or context-dependent group weights."""
 
     def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
                  initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
-                 group_gate="static", text_temporal_pool="last", attention_config=None):
+                 group_gate="static", text_temporal_pool="last", attention_config=None,
+                 text_history_mode="last"):
         super().__init__()
         if group_gate not in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
             raise ValueError("Unknown group_gate condition")
@@ -218,9 +240,13 @@ class ContextNoveltyTextModel(nn.Module):
             raise ValueError("mean5/attention5 are supported only with context_price_only")
         if attention_config is not None and (text_temporal_pool != "attention5" or attention_config != attention5_config()):
             raise ValueError("Saved attention configuration does not match attention5 architecture")
+        if (text_history_mode not in ("last", "history", "difference")
+                or (text_history_mode != "last" and (group_gate != "context_price_only" or text_temporal_pool != "last"))):
+            raise ValueError("history/difference require context_price_only and last-date base embeddings")
         validate_fixed_uniform_weights(initial_group_weights, 5)
         self.used_col_prefixes, self.pred_len, self.group_gate = TEXT_GROUPS, pred_len, group_gate
         self.text_temporal_pool = text_temporal_pool
+        self.text_history_mode = text_history_mode
         self.group_mlps = nn.ModuleDict({
             group: nn.Sequential(nn.Linear(EMBEDDING_SIZE, pred_len)) for group in TEXT_GROUPS
         })
@@ -233,6 +259,14 @@ class ContextNoveltyTextModel(nn.Module):
             nn.init.zeros_(self.gate.weight)
             nn.init.zeros_(self.gate.bias)
         self.attention_pool = AttentionPool5() if text_temporal_pool == "attention5" else None
+        self.history_heads = None
+        if text_history_mode != "last":
+            with torch.random.fork_rng(devices=[]):
+                self.history_heads = nn.ModuleDict({
+                    group: nn.Linear(EMBEDDING_SIZE, pred_len, bias=False) for group in TEXT_GROUPS
+                })
+            for head in self.history_heads.values():
+                nn.init.zeros_(head.weight)
 
     def get_alpha(self):
         return self.fixed_alpha
@@ -246,6 +280,8 @@ class ContextNoveltyTextModel(nn.Module):
         state = {"group_gate": self.group_gate, "text_temporal_pool": self.text_temporal_pool,
                  "text_weight_mode": "fixed", "fixed_alpha": 0.1,
                  "text_alpha": self.get_alpha().detach().cpu().item()}
+        if self.text_history_mode != "last":
+            state["text_history_mode"] = self.text_history_mode
         if self.group_gate == "static":
             state["fixed_group_coefficients"] = self.fixed_group_coefficients()
         return state
@@ -279,6 +315,17 @@ class ContextNoveltyTextModel(nn.Module):
             weights = torch.softmax(self.gate(features), dim=-1)
         heads = torch.stack([self.group_mlps[group](embeddings[:, index])
                              for index, group in enumerate(TEXT_GROUPS)], dim=1)
+        history_details = {}
+        if self.history_heads is not None:
+            mean, rho, history_details = similar_text_history(text_window)
+            history_input = mean if self.text_history_mode == "history" else embeddings-rho[..., None]*mean
+            extra = torch.stack([self.history_heads[group](history_input[:, index])
+                                 for index, group in enumerate(TEXT_GROUPS)], dim=1)
+            history_details.update(history_mean=mean, history_rho=rho, history_input=history_input,
+                                   base_heads=heads, history_heads=extra,
+                                   history_contributions=self.fixed_alpha*weights[..., None]*extra*present[..., None],
+                                   base_contributions=self.fixed_alpha*weights[..., None]*heads*present[..., None])
+            heads = heads+extra
         masked = heads * present.unsqueeze(-1).to(heads.dtype)
         weighted = weights.unsqueeze(-1) * masked
         delta = weighted.sum(dim=1).unsqueeze(-1).expand_as(price_output)
@@ -296,7 +343,7 @@ class ContextNoveltyTextModel(nn.Module):
                             "novelty": novelty, "novelty_used": novelty_used, "pair_available": pair_available,
                             "pair_available_used": pair_available_used,
                             "contributions": self.fixed_alpha * weighted, "features": features,
-                            **attention_details}
+                            **attention_details, **history_details}
         return output
 
 

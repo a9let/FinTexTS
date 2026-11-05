@@ -1030,3 +1030,88 @@ gains or the outcome of retraining with uniform coefficients. Synthetic CPU test
 cover interpolation, missing/single/empty groups, retained anchors, all three
 formulas, partial batches, checkpoint restoration, scaler/window/MSE mismatch
 failures, aggregation and report preservation without reading test_io.pt.
+
+### Additive similar-history and difference heads
+
+Branch `experiment/context-price-text-history` reuses the existing last-date
+path: `pool_text_window(..., "last")` selects `window[:, -1]`, and
+`ContextNoveltyTextModel.forward` evaluates the original per-group `group_mlps`.
+The new `--text_history_mode last|history|difference` defaults to `last`.
+The last-date selection, original head parameters and missing-current-text mask
+are retained. New modes require `context_price_only` and
+`--text_temporal_pool last`; combining them with mean5/attention5 is rejected.
+
+For each group, e is the current embedding and the only history candidates are
+the **previous four rows of the same input window and group**:
+
+```text
+K_j = exp(-(1-clamp(cosine(e,e_j), -1, 1))/0.1) for present previous rows
+m = sum_j K_j*e_j / sum_j K_j
+rho = max_j K_j
+history:    group_head(e) + extra_head(m)
+difference: group_head(e) + extra_head(e-rho*m)
+last:       group_head(e)
+```
+
+Presence is float32 L1 >= 1e-6, before aggregation. Missing history rows are
+excluded; no filling, future rows, other groups or earlier nonempty rows are
+used. With no usable history, m=0 and rho=0. Consequently history's extra output
+is zero, while difference's extra head receives e. If the current text is absent,
+the original post-head group mask zeros both corrections even if past text exists.
+Cosines use normalized copies; m aggregates original vectors without changing
+their norms. Rho is the maximum **unnormalized kernel value**, not a normalized
+history weight.
+
+Each new mode adds five separate bias-free Linear(384,pred_len) heads, initialized
+to zero, in an isolated RNG scope. At pred_len=3 this is **5,760 extra parameters**
+in either mode. Initial predictions exactly match last; FiLM, original heads,
+zero-initialized price gate and batch order match at the same seed. All trainable
+parameters enter the existing Adam optimizer once and train jointly from scratch.
+No trained last weights are loaded into the new training runs.
+
+The unchanged price-only gate uses lags [1,5]. Its group weights multiply the
+sum of the original and extra group outputs, masked after the heads. Fusion is
+the existing fixed-alpha=0.1 anchored blend, with the last known OHLC retained
+when text is absent. FiLM, train-only scaler, temporal splits, loss, metrics,
+learning rate, early stopping, best-checkpoint selection and timing stay on the
+existing runner path.
+
+Args, summary and checkpoint save `text_history_mode`, the fixed four-row/tau
+configuration and head structure. The reconstruction config/state dictionaries
+restore both original and extra heads. The existing best-validation CSV adds
+mode, history-window start/current date, eligible history count, rho, and signed
+`base_contributions_h*` / `history_contributions_h*` for every group/horizon.
+Their sum is checked against the total contribution. Extra contribution plots
+are saved as `validation_history_contributions_h*.png`; old diagnostics remain.
+
+Inside the existing Docker, from the code checkout:
+
+```bash
+bash -n run_context_price_text_history_60.sh
+bash run_context_price_text_history_60.sh
+```
+
+The dispatcher derives from the existing mean5 launcher. It prepares two NVDA
+seed=7 one-epoch checks, then **60 main runs**: history/difference, AAPL ABBV ABT
+ACN ADBE ADI AMAT AMD AMGN AMZN, seeds 7/17/27. Main settings remain seq_len=64,
+label_len=16, pred_len=3, batch_size=32, five linear heads, Adam lr=0.001,
+max epochs=50, patience=10, fixed alpha=0.1. Results are separate:
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_text_history_10_v1/
+  checks/{history,difference}/NVDA/seed7/{train.log,output/}
+  full/{history,difference}/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+Last is **not retrained**: use the existing
+`context_price_only_10_v1/full/context_price_only/{ticker}/seed{seed}/output`.
+The dispatcher checks these 30 saved controls before starting and records their
+root in `last_results_root.txt`; it never edits them. CUDA checks, OMP/MKL=2,
+CODE/PYTHONPATH resolution, full SHA/CODE_COMMIT fallback, script copy, overwrite
+guards, log tails and nonempty summary/checkpoint checks are inherited. Progress
+counts only main runs and ends with `ALL 60 RUNS COMPLETED`.
+
+Synthetic CPU tests cover explicit kernels/m/rho, absent text, no-history cases,
+causal alignment, independent groups, identical initial predictions/parameters/
+RNG/batching, equal parameter counts, gradients, checkpoint/diagnostic restoration
+and the mocked 2-check + 60-main queue. No full queue is run during verification.

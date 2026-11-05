@@ -67,6 +67,7 @@ def parse_args(argv=None):
     parser.add_argument("--text_hidden_size", type=int, default=64)
     parser.add_argument("--text_num_layers", type=int, default=1)
     parser.add_argument("--text_temporal_pool", choices=["last", "mean5", "attention5"], default="last")
+    parser.add_argument("--text_history_mode", choices=["last", "history", "difference"], default="last")
     parser.add_argument("--text_weight", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
@@ -105,6 +106,9 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.text_history_mode != "last":
+        if args.group_gate != "context_price_only" or args.text_temporal_pool != "last" or "fnspid" in args.data_path:
+            parser.error("history/difference require context_price_only, text_temporal_pool=last and no forward fill")
     if args.text_temporal_pool in ("mean5", "attention5"):
         if args.group_gate != "context_price_only" or args.seq_len < 5 or "fnspid" in args.data_path:
             parser.error("mean5/attention5 require context_price_only, seq_len>=5 and data without forward fill")
@@ -168,6 +172,12 @@ def parse_args(argv=None):
     if args.text_temporal_pool == "attention5":
         args.attention_config = attention5_config()
         args.text_model_config["attention_config"] = args.attention_config.copy()
+    if args.text_history_mode != "last":
+        args.text_model_config["text_history_mode"] = args.text_history_mode
+        args.text_history_config = {"mode": args.text_history_mode, "previous_rows": 4, "tau": 0.1,
+                                    "head": {"type": "Linear", "in_features": 384, "out_features": args.pred_len,
+                                             "bias": False, "initialization": "zeros", "groups": list(TEXT_GROUPS)},
+                                    "additional_parameters": len(TEXT_GROUPS)*384*args.pred_len}
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
     args.enc_in = 4
     args.dec_in = 4
@@ -325,7 +335,7 @@ def main(argv=None):
         batch_size=args.batch_size,
     )
     train_generator = _configure_gate_sampling(train_dataloader, args.seed) if args.group_gate else None
-    if args.text_temporal_pool in ("mean5", "attention5"):
+    if args.text_temporal_pool in ("mean5", "attention5") or args.text_history_mode != "last":
         from forecasting_task.window_evidence import window_evidence
         args.window_evidence = {"val": window_evidence(val_dataset), "test": window_evidence(test_dataset)}
         with open(os.path.join(args.logdir, "window_evidence.json"), "x", encoding="utf-8") as handle:
@@ -512,6 +522,9 @@ def main(argv=None):
             if args.text_temporal_pool == "attention5":
                 checkpoint["attention_config"] = args.attention_config.copy()
 
+            if args.text_history_mode != "last":
+                checkpoint.update(text_history_mode=args.text_history_mode, text_history_config=args.text_history_config)
+
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
             )
@@ -596,6 +609,7 @@ def main(argv=None):
         "initial_text_alpha": args.initial_text_alpha,
         "text_mlp_structure": args.text_mlp_structure,
         "text_temporal_pool": args.text_temporal_pool,
+        "text_history_mode": args.text_history_mode,
         "best_text_alpha": best_text_alpha,
         "final_text_alpha": final_fusion_state["text_alpha"],
         "used_col_prefixes": args.used_col_prefixes,
@@ -629,7 +643,9 @@ def main(argv=None):
                        gate_structure=args.gate_structure, novelty_policy=args.novelty_policy,
                        sampling_policy=args.sampling_policy, validation_diagnostics=gate_diagnostics,
                        diagnostic_seconds=diagnostic_seconds)
-    if args.text_temporal_pool in ("mean5", "attention5"):
+    if args.text_history_mode != "last":
+        summary["text_history_config"] = args.text_history_config
+    if args.text_temporal_pool in ("mean5", "attention5") or args.text_history_mode != "last":
         summary["window_evidence"] = args.window_evidence
 
     if args.text_temporal_pool == "attention5":
