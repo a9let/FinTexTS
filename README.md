@@ -967,3 +967,66 @@ mean5's individual daily masks. `verification.csv` and `interpretation.json`
 record the checks and interpretation limits. Synthetic tests exercise explicit
 beta arithmetic, empty/single-date windows, invalid weights, block boundaries,
 changing cohorts, matched saved-run inventory, read-only reporting and all PNGs.
+
+### Frozen-checkpoint uniform/attention ablation on validation
+
+Branch `experiment/attention5-uniform-ablation` starts from
+`experiment/attention5-diagnostics`. The separate analysis script loads the 30
+best attention5 checkpoints (the same ten tickers and seeds 7/17/27) and evaluates
+only validation for lambda=0, 0.5, 1:
+
+```text
+uniform_j = present_j / max(N_present, 1)
+beta_new = (1-lambda) * uniform + lambda * learned_beta
+aggregated = sum_j beta_new_j * original_embedding_j
+```
+
+Absent dates and empty groups keep zero weights and zero aggregates. Group heads
+are masked after Linear using pre-aggregation presence. FiLM, the five heads,
+the price gate, masks, fixed alpha=0.1 and last-price anchor are held fixed. No
+parameters are updated. Lambda=0 uses uniform pooling with the **trained
+attention5 heads**, not a separately trained mean5 model. The lambda=0.5 condition
+softens the learned date coefficients toward uniform weights in each window.
+
+Inside the existing Docker, from the code checkout:
+
+```bash
+python analyze_attention5_uniform_ablation.py
+```
+
+CPU is the default (`--device cuda` is optional). The script restores the saved
+architecture/configuration and strict state dictionaries, uses Dataset_Custom
+with `flag=val` and the existing causal metadata wrapper, and checks the
+train-only scaler against the checkpoint. Saved validation OHLC input, target
+and date fingerprints must match replay; archived validation dates are checked
+when available. All models are in eval mode, parameters are frozen, and inference
+uses torch.no_grad(). MSE sums squared errors over every OHLC/horizon element,
+including the incomplete last batch, in normalized units.
+
+At lambda=1, reconstructed predictions must agree with the original forward.
+Validation MSE must reproduce summary.best_val_mse with rtol=1e-4, atol=1e-6;
+a mismatch stops analysis and names the checkpoint and both MSE values. No test
+dataset, test predictions, runner entry point, optimizer or training is used.
+All 30 runs must pass before a report directory is created.
+
+Reports default to
+`context_price_attention5_10_v1/diagnostics/uniform_ablation/` and existing
+directories are rejected. Options `--results_root`, `--data_root`, `--output_dir`
+relocate inputs or select a new report destination. Source results remain intact.
+The script prints each ticker/seed's three MSEs and saves:
+
+- `per_run.csv`: checkpoint, best epoch, saved/reproduced validation MSE, three
+  lambda MSEs, element/window counts and verification status.
+- `by_seed.csv`: arithmetic means across the same ten stocks for each seed.
+- `across_seeds.csv`: mean and sample std (ddof=1) between the three seed means.
+- `per_ticker.csv`: means across seeds, paired changes and improvement percentages.
+- `comparisons.csv`: strict wins/losses/ties out of ten stocks for lambda=0 and
+  0.5 versus lambda=1 **after averaging seeds**, plus overall MSE changes.
+- `verification.json`: validation fingerprints, tolerance, device and interpretation.
+
+Positive improvement_pct means lower MSE than lambda=1. These are validation
+inference ablations on already trained models; they do not establish test-set
+gains or the outcome of retraining with uniform coefficients. Synthetic CPU tests
+cover interpolation, missing/single/empty groups, retained anchors, all three
+formulas, partial batches, checkpoint restoration, scaler/window/MSE mismatch
+failures, aggregation and report preservation without reading test_io.pt.
