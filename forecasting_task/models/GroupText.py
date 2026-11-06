@@ -229,7 +229,7 @@ class ContextNoveltyTextModel(nn.Module):
     def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
                  initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
                  group_gate="static", text_temporal_pool="last", attention_config=None,
-                 text_history_mode="last"):
+                 text_history_mode="last", gate_text_history_mode="none"):
         super().__init__()
         if group_gate not in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
             raise ValueError("Unknown group_gate condition")
@@ -245,10 +245,18 @@ class ContextNoveltyTextModel(nn.Module):
         if (text_history_mode not in ("last", "history", "difference", "uniform_history")
                 or (text_history_mode != "last" and (group_gate != "context_price_only" or text_temporal_pool != "last"))):
             raise ValueError("History modes require context_price_only and last-date base embeddings")
+        if (gate_text_history_mode not in ("none", "history", "difference", "uniform_history")
+                or (gate_text_history_mode != "none" and (group_gate != "context_price_only"
+                    or text_temporal_pool != "last" or text_history_mode != "last"))):
+            raise ValueError("Gate text history requires context_price_only and both text modes=last")
         validate_fixed_uniform_weights(initial_group_weights, 5)
         self.used_col_prefixes, self.pred_len, self.group_gate = TEXT_GROUPS, pred_len, group_gate
         self.text_temporal_pool = text_temporal_pool
         self.text_history_mode = text_history_mode
+        self.gate_text_history_mode = gate_text_history_mode
+        self.register_parameter("gate_text_vectors", None)
+        if gate_text_history_mode != "none":
+            self.gate_text_vectors = nn.Parameter(torch.zeros(len(TEXT_GROUPS), EMBEDDING_SIZE))
         self.group_mlps = nn.ModuleDict({
             group: nn.Sequential(nn.Linear(EMBEDDING_SIZE, pred_len)) for group in TEXT_GROUPS
         })
@@ -284,6 +292,8 @@ class ContextNoveltyTextModel(nn.Module):
                  "text_alpha": self.get_alpha().detach().cpu().item()}
         if self.text_history_mode != "last":
             state["text_history_mode"] = self.text_history_mode
+        if self.gate_text_history_mode != "none":
+            state["gate_text_history_mode"] = self.gate_text_history_mode
         if self.group_gate == "static":
             state["fixed_group_coefficients"] = self.fixed_group_coefficients()
         return state
@@ -311,10 +321,23 @@ class ContextNoveltyTextModel(nn.Module):
         novelty_used = torch.zeros_like(novelty) if self.group_gate in ("context_no_novelty", "context_price_only") else novelty
         pair_available_used = torch.zeros_like(pair_available) if self.group_gate == "context_price_only" else pair_available
         features = torch.cat((context, novelty_used, pair_available_used), dim=-1)
+        gate_history_details = {}
         if self.gate is None:
+            price_logits = embeddings.new_zeros((batch, 5))
+            text_logits = torch.zeros_like(price_logits)
             weights = embeddings.new_full((batch, 5), 0.2)
         else:
-            weights = torch.softmax(self.gate(features), dim=-1)
+            price_logits = self.gate(features)
+            text_logits = torch.zeros_like(price_logits)
+            if self.gate_text_vectors is not None:
+                mean, rho, _ = similar_text_history(text_window, uniform=self.gate_text_history_mode == "uniform_history")
+                z = embeddings-rho[..., None]*mean if self.gate_text_history_mode == "difference" else mean
+                z = torch.where(present[..., None], z, torch.zeros_like(z))
+                text_logits = (z*self.gate_text_vectors[None]).sum(-1)
+                gate_history_details = {"gate_history_mean": mean, "gate_history_rho": rho, "gate_text_input": z}
+                weights = torch.softmax(price_logits+text_logits, dim=-1)
+            else:
+                weights = torch.softmax(price_logits, dim=-1)
         heads = torch.stack([self.group_mlps[group](embeddings[:, index])
                              for index, group in enumerate(TEXT_GROUPS)], dim=1)
         history_details = {}
@@ -345,7 +368,9 @@ class ContextNoveltyTextModel(nn.Module):
                             "novelty": novelty, "novelty_used": novelty_used, "pair_available": pair_available,
                             "pair_available_used": pair_available_used,
                             "contributions": self.fixed_alpha * weighted, "features": features,
-                            **attention_details, **history_details}
+                            "price_logits": price_logits, "gate_text_logits": text_logits,
+                            "gate_logits": price_logits+text_logits,
+                            **attention_details, **history_details, **gate_history_details}
         return output
 
 

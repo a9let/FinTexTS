@@ -1115,3 +1115,46 @@ Synthetic CPU tests cover explicit kernels/m/rho, absent text, no-history cases,
 causal alignment, independent groups, identical initial predictions/parameters/
 RNG/batching, equal parameter counts, gradients, checkpoint/diagnostic restoration
 and the mocked 2-check + 60-main queue. No full queue is run during verification.
+
+### Uniform control for the additive history head
+
+`experiment/context-price-uniform-history` adds
+`--text_history_mode uniform_history`. It reuses history's exact previous-four-row
+selection and availability mask. Each available previous vector receives weight
+1/n, missing rows receive zero, and empty history produces a zero vector. The
+current row is excluded; original embeddings retain their norms. This mean enters
+the same additional bias-free Linear(384,3) head as history. The existing mask for
+absent current text remains in force.
+
+The five extra heads retain zero initialization and 5,760 parameters in total.
+Initial forecasts, FiLM/head/gate initialization and batch order match last at the
+same seed. Saved last/history/difference behavior is unchanged. Configuration,
+checkpoints and the existing contribution diagnostics support the new mode;
+`text_history_config.weighting` is `uniform_present`, with tau unset because it
+does not determine these weights. The shared helper's rho remains a diagnostic
+similarity value and is not used by the uniform-history head.
+
+Inside the existing Docker:
+
+```bash
+bash -n run_context_price_uniform_history_30.sh
+bash run_context_price_uniform_history_30.sh
+```
+
+One NVDA seed=7 one-epoch check precedes exactly 30 new runs for AAPL ABBV ABT ACN
+ADBE ADI AMAT AMD AMGN AMZN, seeds 7/17/27. FiLM, price gate [1,5], alpha=0.1,
+seq_len=64, label_len=16, pred_len=3, batch_size=32, Adam lr=0.001, max epochs=50
+and patience=10 remain unchanged. The dispatcher inherits CUDA checks, SHA/script
+recording, CODE_COMMIT fallback, overwrite guards, log tails and artifact checks.
+It trains only uniform_history and preserves all saved controls. Results:
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_uniform_history_10_v1/
+  checks/uniform_history/NVDA/seed7/{train.log,output/}
+  full/uniform_history/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+Synthetic CPU tests verify equal weights with gaps, empty history, no current-row
+or earlier-row leakage, single-past-vector equivalence to history with identical
+parameters, initial equality to last, unchanged parameter count/RNG/batching,
+checkpoint/diagnostic restoration and a mocked 1-check + 30-main queue.

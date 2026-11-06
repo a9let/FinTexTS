@@ -172,7 +172,7 @@ class TextHistoryTests(unittest.TestCase):
 
     def test_runner_checkpoint_and_additional_validation_diagnostics(self):
         frame = fixtures.make_frame()
-        for mode in ("history", "difference"):
+        for mode in ("history", "difference", "uniform_history"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 datasets = {flag: fixtures.make_dataset(frame, flag) for flag in ("train", "val", "test")}
                 loaders = {flag: DataLoader(data, batch_size=4, shuffle=flag == "train", drop_last=flag == "train") for flag, data in datasets.items()}
@@ -203,7 +203,9 @@ class TextHistoryTests(unittest.TestCase):
                 self.assertEqual(checkpoint["epoch"], 1)
                 for record in (args, checkpoint, summary):
                     self.assertEqual(record["text_history_mode"], mode)
-                    self.assertEqual(record["text_history_config"]["tau"], .1)
+                    self.assertEqual(record["text_history_config"]["tau"], None if mode == "uniform_history" else .1)
+                    if mode == "uniform_history":
+                        self.assertEqual(record["text_history_config"]["weighting"], "uniform_present")
                     self.assertEqual(record["text_history_config"]["additional_parameters"], 5760)
                 self.assertEqual(summary["window_evidence"], args["window_evidence"])
                 price, text = fixtures.ContextNoveltyTests.make_film(), build_text_model(args["text_model_config"], args["group_weight_mode"])

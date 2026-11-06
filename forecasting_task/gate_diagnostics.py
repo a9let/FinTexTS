@@ -67,6 +67,12 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
                               "pair_available": int(detail["pair_available"][sample, group_index]),
                               "pair_available_used": int(detail["pair_available_used"][sample, group_index]),
                               "weight": float(detail["weights"][sample, group_index])}
+                    if text_model.gate_text_history_mode != "none":
+                        record.update(gate_text_history_mode=text_model.gate_text_history_mode,
+                                      price_logit=float(detail["price_logits"][sample, group_index]),
+                                      gate_text_logit=float(detail["gate_text_logits"][sample, group_index]),
+                                      total_logit=float(detail["gate_logits"][sample, group_index]),
+                                      gate_history_rho=float(detail["gate_history_rho"][sample, group_index]))
                     if text_model.history_heads is not None:
                         start, end = dataset.text_window_bounds(index, 5)
                         record.update(text_history_mode=text_model.text_history_mode,

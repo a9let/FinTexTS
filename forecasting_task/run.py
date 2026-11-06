@@ -68,6 +68,8 @@ def parse_args(argv=None):
     parser.add_argument("--text_num_layers", type=int, default=1)
     parser.add_argument("--text_temporal_pool", choices=["last", "mean5", "attention5"], default="last")
     parser.add_argument("--text_history_mode", choices=["last", "history", "difference", "uniform_history"], default="last")
+    parser.add_argument("--gate_text_history_mode", choices=["none", "history", "difference", "uniform_history"], default="none")
+    parser.add_argument("--gate_control_manifest", default=None)
     parser.add_argument("--text_weight", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
@@ -106,6 +108,12 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.gate_text_history_mode != "none":
+        if (args.model_type.lower() != "film" or args.group_gate != "context_price_only"
+                or args.text_temporal_pool != "last" or args.text_history_mode != "last" or "fnspid" in args.data_path):
+            parser.error("Gate text history requires FiLM/context_price_only and both text modes=last, without forward fill")
+    elif args.gate_control_manifest:
+        parser.error("--gate_control_manifest requires an enabled gate_text_history_mode")
     if args.text_history_mode != "last":
         if args.group_gate != "context_price_only" or args.text_temporal_pool != "last" or "fnspid" in args.data_path:
             parser.error("History modes require context_price_only, text_temporal_pool=last and no forward fill")
@@ -180,6 +188,12 @@ def parse_args(argv=None):
                                     "additional_parameters": len(TEXT_GROUPS)*384*args.pred_len}
         if args.text_history_mode == "uniform_history":
             args.text_history_config.update(weighting="uniform_present", tau=None)
+    if args.gate_text_history_mode != "none":
+        args.text_model_config["gate_text_history_mode"] = args.gate_text_history_mode
+        args.gate_text_history_config = {"mode": args.gate_text_history_mode, "previous_rows": 4,
+                                         "tau": None if args.gate_text_history_mode == "uniform_history" else 0.1,
+                                         "vector_shape": [len(TEXT_GROUPS), 384], "additional_parameters": len(TEXT_GROUPS)*384,
+                                         "initialization": "zeros", "groups": list(TEXT_GROUPS)}
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
     args.enc_in = 4
     args.dec_in = 4
@@ -337,11 +351,14 @@ def main(argv=None):
         batch_size=args.batch_size,
     )
     train_generator = _configure_gate_sampling(train_dataloader, args.seed) if args.group_gate else None
-    if args.text_temporal_pool in ("mean5", "attention5") or args.text_history_mode != "last":
+    if args.text_temporal_pool in ("mean5", "attention5") or args.text_history_mode != "last" or args.gate_text_history_mode != "none":
         from forecasting_task.window_evidence import window_evidence
         args.window_evidence = {"val": window_evidence(val_dataset), "test": window_evidence(test_dataset)}
         with open(os.path.join(args.logdir, "window_evidence.json"), "x", encoding="utf-8") as handle:
             json.dump(args.window_evidence, handle, indent=2)
+    if args.gate_control_manifest:
+        from gate_history_control import load_gate_control
+        args.gate_control_reference = load_gate_control(args.gate_control_manifest, args, [train_dataset, val_dataset, test_dataset])
     if args.model_type.lower() == "dlinear":
         model = DLinear(args)
     elif args.model_type.lower() == "patchtst":
@@ -527,6 +544,12 @@ def main(argv=None):
             if args.text_history_mode != "last":
                 checkpoint.update(text_history_mode=args.text_history_mode, text_history_config=args.text_history_config)
 
+            if args.gate_text_history_mode != "none":
+                checkpoint.update(gate_text_history_mode=args.gate_text_history_mode,
+                                  gate_text_history_config=args.gate_text_history_config)
+                if args.gate_control_manifest:
+                    checkpoint["gate_control_reference"] = args.gate_control_reference
+
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
             )
@@ -647,9 +670,14 @@ def main(argv=None):
                        diagnostic_seconds=diagnostic_seconds)
     if args.text_history_mode != "last":
         summary["text_history_config"] = args.text_history_config
-    if args.text_temporal_pool in ("mean5", "attention5") or args.text_history_mode != "last":
+    if args.text_temporal_pool in ("mean5", "attention5") or args.text_history_mode != "last" or args.gate_text_history_mode != "none":
         summary["window_evidence"] = args.window_evidence
 
+    if args.gate_text_history_mode != "none":
+        summary.update(gate_text_history_mode=args.gate_text_history_mode,
+                       gate_text_history_config=args.gate_text_history_config)
+        if args.gate_control_manifest:
+            summary["gate_control_reference"] = args.gate_control_reference
     if args.text_temporal_pool == "attention5":
         summary["attention_config"] = args.attention_config.copy()
 
