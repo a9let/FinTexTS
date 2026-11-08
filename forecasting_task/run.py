@@ -66,6 +66,7 @@ def parse_args(argv=None):
     
     parser.add_argument("--text_hidden_size", type=int, default=64)
     parser.add_argument("--text_num_layers", type=int, default=1)
+    parser.add_argument("--category_pool", choices=["uniform", "attention"], default=None)
     parser.add_argument("--text_weight", type=float, default=0.1)
     parser.add_argument("--fusion_mode", choices=["blend", "residual"], default="blend")
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
@@ -104,6 +105,8 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.category_pool is not None and (args.model_type.lower() != "film" or args.group_gate != "context_price_only" or "fnspid" in args.data_path):
+        parser.error("--category_pool requires FiLM/context_price_only and dedicated category data without fill")
     if args.group_weight_mode is None:
         args.group_weight_mode = "fixed_uniform" if args.group_gate else "learnable"
     if args.group_gate:
@@ -160,6 +163,11 @@ def parse_args(argv=None):
         args.text_model_config["group_gate"] = args.group_gate
         if args.group_gate != "static":
             args.group_weight_mode = args.group_gate
+    if args.category_pool is not None:
+        from forecasting_task.models.CategoryText import scorer_config
+        args.category_scorer_config = scorer_config(args.category_pool)
+        args.novelty_policy = {"temporal_text_features": "not_computed", "category_context": "current_OHLC_deltas_lags_1_5"}
+        args.text_model_config.update(category_pool=args.category_pool, category_scorer_config=args.category_scorer_config)
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
     args.enc_in = 4
     args.dec_in = 4
@@ -245,7 +253,7 @@ def _run_epoch(
 
         output = model(seq_price_x, seq_x_mark, dec_inp, seq_y_mark)
         if getattr(args, "group_gate", None):
-            metadata = {key: value.float().to(device) for key, value in batch[6].items()}
+            metadata = {key: (value.to(device) if getattr(args, "category_pool", None) else value.float().to(device)) for key, value in batch[6].items()}
             output = text_model(output, seq_price_x[:, -1], seq_text_x[:, -1], price_window=seq_price_x, **metadata)
         else:
             output = text_model(output, seq_price_x[:, -1, :], seq_text_x[:, -1, :, :])
@@ -286,6 +294,9 @@ def main(argv=None):
     if args.group_gate:
         from forecasting_task.data_provider.context_novelty import get_context_novelty_dataloader
         loader_factory = get_context_novelty_dataloader
+    if args.category_pool is not None:
+        from forecasting_task.data_provider.category import get_category_dataloader
+        loader_factory = get_category_dataloader
     train_dataset, train_dataloader = loader_factory(
         seq_len=args.seq_len,
         label_len=args.label_len,
@@ -317,6 +328,15 @@ def main(argv=None):
         batch_size=args.batch_size,
     )
     train_generator = _configure_gate_sampling(train_dataloader, args.seed) if args.group_gate else None
+    if args.category_pool is not None:
+        from forecasting_task.window_evidence import window_evidence
+        from forecasting_task.category_data import file_hash
+        args.category_data_manifest = train_dataset.manifest
+        args.category_manifest_sha256 = file_hash(Path(args.root_path)/"manifest.json")
+        args.window_evidence = {"val": window_evidence(val_dataset), "test": window_evidence(test_dataset)}
+        args.category_window_evidence = {"val": val_dataset.category_evidence(), "test": test_dataset.category_evidence()}
+        with open(os.path.join(args.logdir, "window_evidence.json"), "x", encoding="utf-8") as handle:
+            json.dump(args.window_evidence, handle, indent=2)
     if args.model_type.lower() == "dlinear":
         model = DLinear(args)
     elif args.model_type.lower() == "patchtst":
@@ -495,6 +515,9 @@ def main(argv=None):
                 checkpoint.update(group_gate=args.group_gate, fixed_alpha=0.1, text_weight_mode="fixed",
                                   code_commit=args.code_commit, train_generator_state=train_generator.get_state())
 
+            if args.category_pool is not None:
+                checkpoint.update(category_pool=args.category_pool, category_scorer_config=args.category_scorer_config,
+                                  category_manifest_sha256=args.category_manifest_sha256)
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
             )
@@ -612,6 +635,10 @@ def main(argv=None):
                        sampling_policy=args.sampling_policy, validation_diagnostics=gate_diagnostics,
                        diagnostic_seconds=diagnostic_seconds)
 
+    if args.category_pool is not None:
+        summary.update(category_pool=args.category_pool, category_scorer_config=args.category_scorer_config,
+                       category_manifest_sha256=args.category_manifest_sha256, window_evidence=args.window_evidence,
+                       category_window_evidence=args.category_window_evidence)
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len
         summary["actual_stride"] = model.patch_embedding.stride

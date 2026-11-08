@@ -628,3 +628,241 @@ also printed. Tests cover pair-availability invariance with a nonzero gate,
 presence masking, zero gradients in the ten unused columns, matched initialization
 and batching, checkpoint/diagnostic restoration, a mocked 1+30 queue, statistical
 aggregation, mismatch exclusions, read-only analysis and validation-only selection.
+
+### Same-date category attention inside news groups
+
+`experiment/context-price-category-attention` starts from
+`experiment/context-price-only`. Opt in with `--category_pool uniform|attention`.
+Without this option the existing grouped-embedding path is unchanged. Both new
+conditions use the same new category data; their primary comparison is attention
+versus uniform. The old price_only results are an additional reproduction check.
+
+Categories are **thematic summaries, not individual articles**. Their numerical
+indices do not identify stable topics. The scorer uses no category index or
+positional feature. This experiment uses only the current input date: it is not
+five-date temporal attention and it does not feed history into the group gate.
+Novelty and pair availability are not computed on the category path.
+
+For each news group g and present category k of the current date:
+
+```text
+c = concat(X[-1]-X[-2], X[-1]-X[-6])        # exactly 8 normalized OHLC features
+u[g,k] = tanh(W_e e[g,k] + W_c c + b)      # hidden size 16
+s[g,k] = v^T u[g,k]
+beta[g,k] = masked_softmax_k(s[g,k])
+pooled[g] = sum_k beta[g,k] * e[g,k]
+```
+
+W_e (384→16), W_c (8→16), b (16) and v (16) are shared across macro, sector,
+targetCompany and relatedCompany: **6,304 additional trainable parameters**.
+Values are original normalized MiniLM vectors, with no learned value projection.
+The scorer receives real price deltas only; the parent gate's ten unused feature
+slots never enter it. Softmax is separate per group/object. Absent categories
+have beta=0, a single present category has beta=1, and empty groups have zero
+beta/pooled vector without all-masked-softmax NaNs. Presence comes from source
+text, so vector cancellation does not erase a present category/group.
+
+For uniform, scores are zero and weights are 1/N among present categories. For
+attention, v starts at zero, W_e/W_c use ordinary random Linear initialization,
+and b starts at zero. Isolated RNG preserves initial FiLM, heads, group gate and
+training permutations. Initial attention predictions equal uniform. The first
+backward can have zero W_e/W_c/b gradients with nonzero v gradients; subsequent
+updates can train all scorer parameters. All parameters enter the existing Adam
+optimizer once, with the same lr.
+
+```mermaid
+flowchart LR
+    X["Normalized 64-row OHLC input"] --> F[FiLM]
+    X --> C["Real price context: 8 deltas, lags 1 and 5"]
+    E["Current-date category embeddings + explicit source-text masks"] --> S["Shared additive scorer: hidden 16"]
+    C --> S
+    S --> B["Masked category softmax, separately per news group"]
+    B --> P["Weighted sum of original category vectors"]
+    E --> P
+    P --> H["4 original news-group Linear 384 to 3 heads"]
+    L["Original filing mean of five subcategories"] --> FH["Original filing Linear 384 to 3"]
+    C --> G["Unchanged price-only group gate"]
+    H --> D["Mask heads; weight and sum group corrections"]
+    FH --> D
+    G --> D
+    F --> O["0.9 FiLM + 0.1 last known OHLC + 0.1 delta"]
+    D --> O
+    X --> O
+```
+
+Filing is unchanged: the same mean over its five original subcategories, the
+same encoder truncation and the same group head; it has no category attention.
+There are still five independent Linear(384,3) forecast heads. The inter-group
+gate is the original zero-initialized Linear(18,5) receiving price context plus
+its original zero novelty/pair slots. Alpha stays fixed at 0.1, fusion stays
+anchored blend, and the original post-head mask zeros absent groups including
+bias. FiLM, Dataset_Custom OHLC/scaling/splits, losses/metrics, early stopping,
+best-validation selection and training timing remain on the existing runner path.
+
+#### Separate embedding preparation and provenance
+
+The source of truth is `notebooks/prepare_embeddings.ipynb`:
+
+- FinTexTS `EXAONE-BI/FinTexTS`, train split, revision
+  `6a4ce04ac3f2e8a4ae15a5826e6980b50560eb29`.
+- `sentence-transformers/all-MiniLM-L6-v2`, revision
+  `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`.
+- Strip strings; null/empty strings are absent. Encode present texts only,
+  batch_size=64, normalize_embeddings=True, convert_to_numpy=True, float32.
+  Absent vectors are exactly zero. The pinned encoder's default max_seq_length
+  is read and recorded without overriding it, including for filing.
+
+Preparation requires the existing notebook environment's `datasets` and
+`sentence-transformers` packages plus parquet support. No dependencies are
+installed automatically. The normal runner/verification/tests do not import the
+encoder packages. Encoding per ticker can produce minor float32 batch-rounding
+differences from the notebook's global column batches; the required legacy-vector
+comparison detects them against the explicit tolerance rather than assuming
+identity.
+
+The **new** format lives at
+`/auto/datasets/kondyurin/FinTexTS/minilm_category_attention_v1/fintexts`:
+
+- Existing date/ticker/OHLC and all five `{group}_emb0..383` columns are copied
+  unchanged from `minilm_reproduction_v1`, including filing.
+- Each `macro_category1..5`, `sector_category1..5`,
+  `targetCompany_category1..3` and `relatedCompany_category1..3` has its own
+  `{source_column}_emb0..383` and boolean `{source_column}_present`.
+- `filing_present` is derived from the five original filing source-text masks.
+- `manifest.json` records revisions/policies, encoder max length and library
+  versions, schema, cleaned source-text/row digest, new and legacy parquet hashes,
+  row counts and maximum absolute group-mean reproduction errors.
+
+CategoryDataset wraps the unchanged Dataset_Custom and aligns its exact split
+rows/scaler. It supplies only the **last input date's** category values/masks;
+filing keeps its grouped vector. The four news groups are padded to five slots
+internally, with false masks and zero values in padding slots.
+
+Preparation is an explicit server step, separate from the training queue:
+
+```bash
+python prepare_category_embeddings.py prepare \
+  --legacy_root /auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts \
+  --output /auto/datasets/kondyurin/FinTexTS/minilm_category_attention_v1/fintexts
+
+python prepare_category_embeddings.py verify \
+  --legacy_root /auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts \
+  --data_root /auto/datasets/kondyurin/FinTexTS/minilm_category_attention_v1/fintexts
+```
+
+The default reproduction tolerance is **atol=1e-6, rtol=0**, and each group's
+maximum absolute difference is printed and saved. Filing is independently
+re-encoded with the unchanged default truncation to check its mean, then its
+original parquet vector is retained. Mismatches, incompatible raw-text versus
+legacy norm presence, changed source OHLC/rows, normalization errors or provenance
+contradictions stop preparation/verification. Old parquet are never overwritten;
+an existing output directory is rejected. An interrupted preparation without a
+passed manifest cannot be used for training.
+
+If separate category vectors already exist in this verified format, reuse them:
+
+```bash
+python prepare_category_embeddings.py prepare --reuse_from /path/to/verified/category_cache \
+  --output /path/to/a/new/category_directory
+```
+
+Reuse verifies source texts against the pinned raw dataset, encoder provenance,
+file fingerprints and legacy reproduction before copying. It does not encode
+again. Group averages are never used to reconstruct category vectors.
+
+#### Training and diagnostics
+
+Inside the existing Docker, from the checkout, **after preparation/verification**:
+
+```bash
+bash -n run_context_price_category_attention_60.sh
+bash run_context_price_category_attention_60.sh
+```
+
+The queue verifies all 100 category parquet and compatibility first; it does not
+prepare or download embeddings. It runs two separate NVDA seed=7 one-epoch checks
+(uniform, attention), then exactly **60** main runs: AAPL ABBV ABT ACN ADBE ADI
+AMAT AMD AMGN AMZN x seeds 7/17/27 x both conditions. Settings are seq_len=64,
+label_len=16, pred_len=3, batch_size=32, Adam lr=0.001, max epochs=50, patience=10.
+CUDA/OMP/MKL checks, CODE/PYTHONPATH resolution, SHA/CODE_COMMIT fallback, script
+copy, overwrite guards, failure log tails and nonempty artifacts are inherited.
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_category_attention_10_v1/
+  checks/{uniform,attention}/NVDA/seed7/{train.log,output/}
+  full/{uniform,attention}/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+Args/checkpoint/summary save the category mode, scorer structure and manifest
+fingerprint; args also retain full data provenance. State dictionaries restore
+the scorer and original modules. Validation/test `window_evidence` certifies
+normalized OHLC inputs, future targets and their dates. Separate
+`category_window_evidence` hashes the actual last-date category values and explicit
+masks for each evaluation window. Evaluation keeps incomplete batches.
+
+From the **best validation checkpoint**, the original group CSV/plots remain.
+`validation_category_diagnostics.csv` additionally saves date/ticker/seed, actual
+source category column, presence, beta, group weight w, the shared group head's
+output on each category, signed category contribution and group contribution:
+
+```text
+C[g,k,h] = alpha * w[g] * beta[g,k] * (W_g e[g,k] + b_g)[h]
+sum_k C[g,k,h] = alpha * w[g] * present_group[g] * (W_g pooled[g] + b_g)[h]
+```
+
+Filing is saved as one grouped contribution. `validation_prediction_components.csv`
+has one row per window/horizon/OHLC channel, containing `(1-alpha)*FiLM`,
+`alpha*last_price`, the broadcast sum of text contributions, prediction and their
+reconstruction. Both identities are checked with rtol=1e-5, atol=1e-6 to allow
+float32 Linear/reduction rounding in normalized units. Head bias is apportioned
+by beta, which sums to one for nonempty groups; empty groups contribute zero.
+The source key is dataset revision + ticker + date + original category column.
+For filing_group_mean, the five source names are in the manifest. Beta are
+aggregation coefficients, and C is an arithmetic forecast decomposition: neither
+is causal importance or proof that the market did/did not absorb a summary.
+
+#### Matched comparison and reproduction
+
+After the server runs finish:
+
+```bash
+python analyze_context_price_category_attention.py
+```
+
+Main comparison is new attention versus new uniform on identical category data.
+Additional sources, as used by the existing analysis code, are
+`context_price_only_10_v1/full/context_price_only/` and
+`film_compare_50ep_v1/full/baseline/`. The script checks the same ten tickers/seeds,
+FiLM/training/head/gate settings, scaler, split policy, OHLC windows/targets and
+new category data/mask hashes. It prints/saves per-run `full`, `partial`,
+`mismatch`, `not_checked` and their counts. Full means all saved validation/test
+fingerprints, normalized test arrays and saved validation dates agree; primary
+category runs additionally verify category values/masks/manifest. Historical
+missing validation hashes remain partial, never upgraded just because dates or
+tickers agree. This check does not independently hash old raw text embeddings.
+
+The old price_only checkpoint is restored into the parameter-identical new
+uniform path and evaluated on the new category inputs. Its predictions must
+match the old grouped-vector forward (rtol=1e-5, atol=1e-6), and validation/test
+MSE plus test MAE must reproduce its saved best metrics (rtol=1e-4, atol=1e-6).
+This isolates aggregation while keeping **the same trained weights**; it is
+different from expecting two independently trained runs to have identical
+floating-point trajectories. Results appear in `old_price_only_reproduction.csv`.
+
+Reports default to the new root's `diagnostics/comparison_10/` and are not
+overwritten. Path options are `--results_root`, `--last_root`, `--baseline_root`,
+`--data_root`, `--legacy_data_root`, `--output_dir`. CSV tables contain each run's
+validation MSE/test MSE/test MAE, means over ten tickers per seed, mean/sample std
+(ddof=1) between seed means, relative changes, paired ticker differences and
+wins/ties after averaging seeds. Negative left-minus-right/relative change means
+lower error for the left condition. Missing metrics remain missing. Primary
+incompatibility blocks uniform/attention selection but saves verification/issues
+and all available metrics; the CLI then exits unsuccessfully. Incompatible extra
+references are excluded from paired comparisons. Selection uses validation MSE
+only; test scores and references cannot select the primary variant.
+
+Local checks use synthetic normalized categories, small temporary parquet and
+mocked saved runs/queues. The pinned encoder/full source dataset are not downloaded
+or prepared by tests. **Real server-data reproduction verification is still
+pending** until the explicit preparation/verify commands above are run. No real
+training or push is part of local verification.

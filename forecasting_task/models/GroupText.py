@@ -220,7 +220,7 @@ class ContextNoveltyTextModel(nn.Module):
         return state
 
     def forward(self, price_output, last_price, embeddings, *, price_window, novelty,
-                pair_available, return_details=False):
+                pair_available, return_details=False, group_present=None):
         batch = embeddings.shape[0]
         if embeddings.ndim != 3 or embeddings.shape[1:] != (5, 384):
             raise ValueError("Expected last-day embeddings [batch, 5, 384]")
@@ -240,7 +240,9 @@ class ContextNoveltyTextModel(nn.Module):
             weights = embeddings.new_full((batch, 5), 0.2)
         else:
             weights = torch.softmax(self.gate(features), dim=-1)
-        present = embeddings.abs().sum(dim=-1) >= 1e-6
+        present = embeddings.abs().sum(dim=-1) >= 1e-6 if group_present is None else group_present.bool()
+        if present.shape != (batch, 5):
+            raise ValueError("Expected five group-presence masks per sample")
         heads = torch.stack([self.group_mlps[group](embeddings[:, index])
                              for index, group in enumerate(TEXT_GROUPS)], dim=1)
         masked = heads * present.unsqueeze(-1).to(heads.dtype)
@@ -260,6 +262,9 @@ def build_text_model(config, group_weight_mode="learnable"):
         expected = "fixed_uniform" if config["group_gate"] == "static" else config["group_gate"]
         if group_weight_mode != expected:
             raise ValueError(f"group_gate={config['group_gate']} requires group_weight_mode={expected}")
+        if "category_pool" in config:
+            from forecasting_task.models.CategoryText import CategoryTextModel
+            return CategoryTextModel(**config)
         return ContextNoveltyTextModel(**config)
     if group_weight_mode == "fixed_uniform":
         return FixedUniformTextModel(**config)

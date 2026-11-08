@@ -20,12 +20,20 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
     table_path = root / "validation_group_diagnostics.csv"
     rows, dates, weights, contributions = [], [], [], []
     squared_sum, absolute_sum, elements, next_index = 0., 0., 0, 0
+    category_rows, component_rows = [], []
     with torch.no_grad():
         for batch in loader:
             x, text, x_mark, y_mark, decoder, target = prepare_batch(batch, device, args.pred_len, args.label_len)
-            metadata = {key: value.float().to(device) for key, value in batch[6].items()}
-            output, detail = text_model(model(x, x_mark, decoder, y_mark), x[:, -1], text[:, -1],
+            category = getattr(args, "category_pool", None) is not None
+            metadata = {key: (value.to(device) if category else value.float().to(device)) for key, value in batch[6].items()}
+            price_output = model(x, x_mark, decoder, y_mark)
+            output, detail = text_model(price_output, x[:, -1], text[:, -1],
                                         price_window=x, return_details=True, **metadata)
+            if category:
+                from forecasting_task.category_diagnostics import category_records
+                a, b = category_records(detail, price_output, x[:, -1], output, batch[5].tolist(), dataset, args, text_model.fixed_alpha)
+                category_rows.extend(a)
+                component_rows.extend(b)
             error = (output - target).double()
             squared_sum += error.square().sum().item()
             absolute_sum += error.abs().sum().item()
@@ -81,5 +89,10 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
     for horizon in range(args.pred_len):
         plot(contributions[:, :, horizon], f"Validation group contributions, horizon {horizon + 1}",
              "Contribution to normalized OHLC prediction", f"validation_contributions_h{horizon + 1}.png")
+    category_info = {}
+    if category_rows:
+        from forecasting_task.category_diagnostics import save_category_records
+        category_info = save_category_records(root, category_rows, component_rows)
     return {"table": table_path.name, "plots": plots, "windows": next_index, "rows": len(rows),
+            **({"category_diagnostics": category_info} if category_info else {}),
             "mse": mse, "mae": mae, "checkpoint": "best_checkpoint.pt"}
