@@ -182,10 +182,15 @@ class ContextNoveltyTextModel(nn.Module):
 
     def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
                  initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
-                 group_gate="static"):
+                 group_gate="static", price_gate_mode="shared"):
         super().__init__()
         if group_gate not in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
             raise ValueError("Unknown group_gate condition")
+        if price_gate_mode not in ("shared", "per_horizon"):
+            raise ValueError("price_gate_mode must be shared or per_horizon")
+        if price_gate_mode != "shared" and group_gate != "context_price_only":
+            raise ValueError("per_horizon requires context_price_only")
+        self.price_gate_mode = price_gate_mode
         if tuple(used_col_prefixes) != TEXT_GROUPS or num_layers != 1 or pred_len < 1:
             raise ValueError("group_gate requires five ordered groups and one linear layer")
         if initial_text_weight != 0.1 or fusion_mode != "blend":
@@ -203,6 +208,14 @@ class ContextNoveltyTextModel(nn.Module):
                 self.gate = nn.Linear(18, 5)
             nn.init.zeros_(self.gate.weight)
             nn.init.zeros_(self.gate.bias)
+            if price_gate_mode == "per_horizon":
+                shared = self.gate
+                with torch.random.fork_rng(devices=[]):
+                    self.gate = nn.Linear(18, 5 * pred_len)
+                # Independent horizon rows, each copied from the original shared gate.
+                with torch.no_grad():
+                    self.gate.weight.copy_(shared.weight.repeat(pred_len, 1))
+                    self.gate.bias.copy_(shared.bias.repeat(pred_len))
 
     def get_alpha(self):
         return self.fixed_alpha
@@ -215,6 +228,8 @@ class ContextNoveltyTextModel(nn.Module):
     def fusion_state(self):
         state = {"group_gate": self.group_gate, "text_weight_mode": "fixed", "fixed_alpha": 0.1,
                  "text_alpha": self.get_alpha().detach().cpu().item()}
+        if self.group_gate == "context_price_only":
+            state["price_gate_mode"] = self.price_gate_mode
         if self.group_gate == "static":
             state["fixed_group_coefficients"] = self.fixed_group_coefficients()
         return state
@@ -238,13 +253,16 @@ class ContextNoveltyTextModel(nn.Module):
         features = torch.cat((context, novelty_used, pair_available_used), dim=-1)
         if self.gate is None:
             weights = embeddings.new_full((batch, 5), 0.2)
+        elif self.price_gate_mode == "per_horizon":
+            logits = self.gate(features).view(batch, self.pred_len, 5).transpose(1, 2)
+            weights = torch.softmax(logits, dim=1)
         else:
             weights = torch.softmax(self.gate(features), dim=-1)
         present = embeddings.abs().sum(dim=-1) >= 1e-6
         heads = torch.stack([self.group_mlps[group](embeddings[:, index])
                              for index, group in enumerate(TEXT_GROUPS)], dim=1)
         masked = heads * present.unsqueeze(-1).to(heads.dtype)
-        weighted = weights.unsqueeze(-1) * masked
+        weighted = (weights if self.price_gate_mode == "per_horizon" else weights.unsqueeze(-1)) * masked
         delta = weighted.sum(dim=1).unsqueeze(-1).expand_as(price_output)
         output = (1 - self.fixed_alpha) * price_output + self.fixed_alpha * (last_price.unsqueeze(1) + delta)
         if return_details:

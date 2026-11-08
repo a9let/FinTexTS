@@ -45,9 +45,13 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
                               "novelty": float(detail["novelty"][sample, group_index]),
                               "novelty_used": float(detail["novelty_used"][sample, group_index]),
                               "pair_available": int(detail["pair_available"][sample, group_index]),
-                              "pair_available_used": int(detail["pair_available_used"][sample, group_index]),
-                              "weight": float(detail["weights"][sample, group_index])}
+                              "pair_available_used": int(detail["pair_available_used"][sample, group_index])}
+                    group_weights = detail["weights"][sample, group_index]
+                    if np.ndim(group_weights) == 0:
+                        record["weight"] = float(group_weights)
                     for horizon in range(args.pred_len):
+                        record[f"weight_h{horizon + 1}"] = float(
+                            group_weights[horizon] if np.ndim(group_weights) else group_weights)
                         record[f"head_h{horizon + 1}"] = float(detail["heads"][sample, group_index, horizon])
                         record[f"contribution_h{horizon + 1}"] = float(detail["contributions"][sample, group_index, horizon])
                     rows.append(record)
@@ -77,7 +81,12 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
             figure.savefig(handle, format="png", dpi=140)
         plots.append(filename)
 
-    plot(weights, "Validation group weights (best checkpoint)", "Group weight", "validation_weights.png")
+    if weights.ndim == 2:
+        plot(weights, "Validation group weights (best checkpoint)", "Group weight", "validation_weights.png")
+    else:
+        for horizon in range(args.pred_len):
+            plot(weights[:, :, horizon], f"Validation group weights, horizon {horizon + 1}",
+                 "Group weight", f"validation_weights_h{horizon + 1}.png")
     for horizon in range(args.pred_len):
         plot(contributions[:, :, horizon], f"Validation group contributions, horizon {horizon + 1}",
              "Contribution to normalized OHLC prediction", f"validation_contributions_h{horizon + 1}.png")

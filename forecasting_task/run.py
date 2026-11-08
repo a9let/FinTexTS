@@ -72,6 +72,7 @@ def parse_args(argv=None):
     parser.add_argument("--group_gate", choices=["static", "context_novelty", "context_no_novelty", "context_price_only"], default=None,
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
     parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
+    parser.add_argument("--price_gate_mode", choices=["shared", "per_horizon"], default="shared")
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
         help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
@@ -104,6 +105,8 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.price_gate_mode != "shared" and args.group_gate != "context_price_only":
+        parser.error("--price_gate_mode per_horizon requires --group_gate context_price_only")
     if args.group_weight_mode is None:
         args.group_weight_mode = "fixed_uniform" if args.group_gate else "learnable"
     if args.group_gate:
@@ -128,6 +131,9 @@ def parse_args(argv=None):
                                 "parameters": 95, "initialization": "zeros"}
                                if args.group_gate != "static" else None)
         args.sampling_policy = "independent_train_generator"
+        if args.group_gate == "context_price_only":
+            outputs = 5 * (args.pred_len if args.price_gate_mode == "per_horizon" else 1)
+            args.gate_structure.update(out_features=outputs, parameters=19 * outputs)
     if not 0 < args.text_weight < 1:
         parser.error("--text_weight must satisfy 0 < text_weight < 1")
     if args.text_num_layers < 1 or args.text_hidden_size < 1 or args.pred_len < 1:
@@ -158,6 +164,8 @@ def parse_args(argv=None):
     }
     if args.group_gate:
         args.text_model_config["group_gate"] = args.group_gate
+        if args.group_gate == "context_price_only":
+            args.text_model_config["price_gate_mode"] = args.price_gate_mode
         if args.group_gate != "static":
             args.group_weight_mode = args.group_gate
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
@@ -317,6 +325,9 @@ def main(argv=None):
         batch_size=args.batch_size,
     )
     train_generator = _configure_gate_sampling(train_dataloader, args.seed) if args.group_gate else None
+    if args.group_gate == "context_price_only":
+        from forecasting_task.window_evidence import window_evidence
+        args.window_evidence = {"val": window_evidence(val_dataset), "test": window_evidence(test_dataset)}
     if args.model_type.lower() == "dlinear":
         model = DLinear(args)
     elif args.model_type.lower() == "patchtst":
@@ -494,6 +505,8 @@ def main(argv=None):
             if args.group_gate:
                 checkpoint.update(group_gate=args.group_gate, fixed_alpha=0.1, text_weight_mode="fixed",
                                   code_commit=args.code_commit, train_generator_state=train_generator.get_state())
+                if args.group_gate == "context_price_only":
+                    checkpoint.update(price_gate_mode=args.price_gate_mode, window_evidence=args.window_evidence)
 
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
@@ -612,6 +625,8 @@ def main(argv=None):
                        sampling_policy=args.sampling_policy, validation_diagnostics=gate_diagnostics,
                        diagnostic_seconds=diagnostic_seconds)
 
+    if args.group_gate == "context_price_only":
+        summary.update(price_gate_mode=args.price_gate_mode, window_evidence=args.window_evidence)
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len
         summary["actual_stride"] = model.patch_embedding.stride

@@ -628,3 +628,107 @@ also printed. Tests cover pair-availability invariance with a nonzero gate,
 presence masking, zero gradients in the ten unused columns, matched initialization
 and batching, checkpoint/diagnostic restoration, a mocked 1+30 queue, statistical
 aggregation, mismatch exclusions, read-only analysis and validation-only selection.
+
+## Horizon-specific price gate (isolated experiment)
+
+Branch `experiment/context-price-horizon-gate` starts from `experiment/context-price-only`.
+It uses the original ready-made group embeddings in
+`minilm_reproduction_v1/fintexts`, the unchanged `Dataset_Custom` and its existing
+context wrapper. There are no category embeddings, new data loaders or temporal
+text aggregation. Text heads still receive only the last input row.
+
+`--price_gate_mode shared` is the default and retains the original shared gate
+forward and state-dict layout. Old checkpoint configurations without this field
+restore as `shared`. `--price_gate_mode per_horizon` is allowed only with
+`--group_gate context_price_only` and produces independent group logits per horizon:
+
+```text
+c = concat(X[-1] - X[-2], X[-1] - X[-6])  # normalized OHLC, original order
+features = concat(c, zeros(5), zeros(5))
+w[g,h] = softmax_over_groups((V_h features + b_h)[g])
+present[g] = float32_L1(last_embedding[g]) >= 1e-6
+delta[h] = sum_g w[g,h] * present[g] * Linear_g(last_embedding[g])[h]
+prediction[h,:] = 0.9*FiLM[h,:] + 0.1*last_price[:] + 0.1*delta[h]
+```
+
+The gate is represented by `Linear(18, 5*pred_len)` with horizon-major rows
+(285 parameters for three horizons, versus 95 for shared). Each horizon starts
+as a copy of the original zero-initialized shared gate. Parameters are independent
+after initialization; weights initially equal 0.2 and forecasts match shared.
+Gate construction preserves RNG state, FiLM/head initialization and train batch
+order for the same seed. Missing groups are masked after their heads and weights
+are not renormalized over present groups. The last-price anchor remains even
+when all text is absent. Alpha stays fixed at 0.1.
+
+FiLM, five `Linear(384,3)` heads, Adam lr=0.001, train-only scaler, splits,
+metrics, early stopping and best-validation checkpoint selection remain unchanged.
+The gate mode/configuration is recorded in args, history, checkpoint and summary.
+Validation CSV exports `weight_h1..h3` and signed `contribution_h1..h3` per group;
+per-horizon weight/contribution plots use the best checkpoint. Contributions
+include alpha and broadcast identically to all four OHLC channels.
+New shared and per-horizon runs persist fingerprints of normalized validation/test
+input windows, future targets, input end dates and target dates.
+
+On **astra, inside the existing CUDA Docker**, from this branch's code directory:
+
+```bash
+bash -n run_context_price_horizon_gate_30.sh
+bash run_context_price_horizon_gate_30.sh per_horizon
+```
+
+The queue first runs NVDA seed 7 for one epoch in `checks/per_horizon/`, then
+exactly 30 full runs: AAPL ABBV ABT ACN ADBE ADI AMAT AMD AMGN AMZN,
+seeds 7/17/27. Settings are inherited from the old queue: seq_len=64,
+label_len=16, pred_len=3, batch_size=32, text_num_layers=1, text_hidden_size=64
+(unused), 50 epochs, patience=10. Results are written to:
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_horizon_gate_10_v1/
+  checks/per_horizon/NVDA/seed7/{train.log,output/}
+  full/per_horizon/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+The dispatcher checks CUDA, required input files and every destination before
+training. It refuses existing run directories, stops on errors with log tails,
+requires nonempty summary/checkpoint, records the full code SHA and script copy,
+uses OMP/MKL threads=2 and reports completed=N/30. If `.git` is unavailable in
+Docker, pass the actual full code SHA in `CODE_COMMIT`; Git configuration is not
+modified. Training is always from scratch.
+
+After runs finish, compare against the saved historical shared control:
+
+```bash
+python analyze_context_price_horizon_gate.py
+```
+
+The CPU analyzer requires exactly 30 unique ticker/seed checkpoints per condition.
+It checks saved settings, split policy, train-only scaler and current reconstructed
+windows. It replays validation with the selected best checkpoint (no runner
+entry point), reproduces `best_val_mse` within rtol=1e-4/atol=1e-6, and uses only
+normalized `outputs`, `inputs`, `ground_truths` in `test_io.pt` for test metrics
+and window checks. Per-horizon metrics include all OHLC elements and incomplete
+last batches. It writes per-run overall and horizon validation MSE/test MSE/MAE,
+seed means, mean/sample std between seed means, paired ticker differences,
+relative changes (negative means improvement) and wins after averaging seeds.
+Selection uses overall validation MSE exclusively.
+
+`window_verification.csv` explicitly distinguishes `full`, `partial`, `mismatch`
+and `not_checked`. Historical validation dates plus reproduced aggregate MSE
+do **not** prove that every historical validation input/target was identical:
+without persisted fingerprints the report is `partial`, and selection is only
+provisional. Missing or contradictory windows/settings block strict selection;
+reports are saved before stopping. Existing diagnostic report folders are refused.
+
+For a strict comparison, run a separate matched shared control from this same
+code and data, then analyze both new cohorts:
+
+```bash
+bash run_context_price_horizon_gate_30.sh shared
+python analyze_context_price_horizon_gate.py --matched_shared
+```
+
+This optional queue runs its own one-epoch NVDA check and 30 shared runs in
+`context_price_horizon_gate_10_v1_matched_shared`, preserving historical controls.
+New persisted validation/test fingerprints must match in both conditions for
+strict selection. Historical and matched reports use separate subdirectories
+under `context_price_horizon_gate_10_v1/diagnostics/`.
