@@ -10,7 +10,7 @@ from forecasting_task.models.GroupText import TEXT_GROUPS
 from forecasting_task.models.GroupGRUAttention import WINDOW
 
 
-def temporal_records(dataset, indices, film_output, last_price, output, detail, alpha):
+def temporal_records(dataset, indices, film_output, last_price, output, detail, alpha, mode="group_gru_attention"):
     torch.testing.assert_close(detail["date_contributions"].sum(dim=1), detail["contributions"], rtol=1e-5, atol=1e-6)
     film_part = (1 - alpha) * film_output
     anchor_part = alpha * last_price[:, None].expand_as(output)
@@ -30,17 +30,20 @@ def temporal_records(dataset, indices, film_output, last_price, output, detail, 
             beta = arrays["temporal_beta"][sample, :, group_index]
             if np.any(beta[~mask] != 0) or not np.isclose(beta.sum(), float(mask.any()), rtol=1e-6, atol=1e-7):
                 raise ValueError("Invalid masked temporal attention")
-            groups[index, group] = {"text_temporal_pool": "group_gru_attention",
+            groups[index, group] = {"text_temporal_pool": mode,
                                     "text_window_dates": json.dumps(row_dates),
                                     "text_window_present": json.dumps(mask.astype(int).tolist()),
                                     "text_window_beta": json.dumps(beta.tolist()),
                                     "available_dates": int(mask.sum())}
             for row, date in enumerate(row_dates):
                 record = {"window_index": index, "input_end_date": row_dates[-1], "group": group,
-                          "date": date, "age": float(arrays["temporal_ages"][row]),
-                          "gap_scaled": float(arrays["temporal_gaps"][sample, row, group_index]),
-                          "present": int(mask[row]), "beta": float(beta[row]),
-                          "group_weight": float(arrays["weights"][sample, group_index])}
+                          "date": date, "age": float(arrays["temporal_ages"][row])}
+                if "temporal_gaps" in arrays:
+                    record["gap_scaled"] = float(arrays["temporal_gaps"][sample, row, group_index])
+                record.update(present=int(mask[row]), beta=float(beta[row]),
+                              group_weight=float(arrays["weights"][sample, group_index]))
+                if "temporal_gaps" not in arrays:
+                    record["representation"] = "contextual_BiGRU_state_projected_64_to_384"
                 for horizon in range(output.shape[1]):
                     record[f"date_contribution_h{horizon + 1}"] = float(arrays["date_contributions"][sample, row, group_index, horizon])
                     record[f"group_contribution_h{horizon + 1}"] = float(arrays["contributions"][sample, group_index, horizon])

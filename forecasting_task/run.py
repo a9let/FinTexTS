@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import os
 import random
 import json
@@ -72,7 +73,7 @@ def parse_args(argv=None):
     parser.add_argument("--group_gate", choices=["static", "context_novelty", "context_no_novelty", "context_price_only"], default=None,
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
     parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
-    parser.add_argument("--text_temporal_pool", choices=["last", "group_gru_attention"], default="last")
+    parser.add_argument("--text_temporal_pool", choices=["last", "group_gru_attention", "group_han_temporal", "group_han_uniform"], default="last")
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
         help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
@@ -105,8 +106,8 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
-    if args.text_temporal_pool == "group_gru_attention" and (args.group_gate != "context_price_only" or args.seq_len < 20):
-        parser.error("group_gru_attention requires context_price_only and seq_len>=20")
+    if args.text_temporal_pool != "last" and (args.group_gate != "context_price_only" or args.seq_len < 20):
+        parser.error("temporal text modes require context_price_only and seq_len>=20")
     if args.group_weight_mode is None:
         args.group_weight_mode = "fixed_uniform" if args.group_gate else "learnable"
     if args.group_gate:
@@ -242,8 +243,16 @@ def _run_epoch(
     input_chunks = []
     output_chunks = []
     gt_chunks = []
+    batch_audit = hashlib.sha256() if is_train and getattr(args, "group_gate", None) == "context_price_only" else None
+    audit_windows, audit_batches = 0, 0
 
     for batch in dataloader:
+        if batch_audit is not None:
+            indices = np.asarray(batch[5], dtype="<i8")
+            batch_audit.update(np.asarray([len(indices)], dtype="<i8").tobytes())
+            batch_audit.update(indices.tobytes())
+            audit_windows += len(indices)
+            audit_batches += 1
         seq_price_x, seq_text_x, seq_x_mark, seq_y_mark, dec_inp, ground_truth = _prepare_batch(
             batch, device, args.pred_len, args.label_len
         )
@@ -254,7 +263,7 @@ def _run_epoch(
         output = model(seq_price_x, seq_x_mark, dec_inp, seq_y_mark)
         if getattr(args, "group_gate", None):
             metadata = {key: value.float().to(device) for key, value in batch[6].items()}
-            if getattr(args, "text_temporal_pool", "last") == "group_gru_attention":
+            if getattr(args, "text_temporal_pool", "last") != "last":
                 metadata["text_window"] = seq_text_x
             output = text_model(output, seq_price_x[:, -1], seq_text_x[:, -1], price_window=seq_price_x, **metadata)
         else:
@@ -277,6 +286,10 @@ def _run_epoch(
         mae_sum += mae_loss.item() * batch_size
         count += batch_size
 
+    if batch_audit is not None:
+        dataloader.fintexts_batch_order = {"sha256": batch_audit.hexdigest(), "windows": audit_windows,
+                                           "batches": audit_batches, "batch_size": dataloader.batch_size,
+                                           "drop_last": dataloader.drop_last}
     mse = mse_sum / max(count, 1)
     mae = mae_sum / max(count, 1)
     if collect_io:
@@ -368,6 +381,11 @@ def main(argv=None):
     model = model.to(device)
     
     text_model = build_text_model(args.text_model_config, args.group_weight_mode).to(device)
+    if args.group_gate == "context_price_only":
+        from forecasting_task.experiment_evidence import common_initialization, source_data_evidence, state_fingerprint
+        args.common_initialization = common_initialization(model, text_model)
+        args.temporal_initialization_sha256 = state_fingerprint(text_model.temporal_pool) if hasattr(text_model, "temporal_pool") else None
+        args.source_data_evidence = source_data_evidence({"train": train_dataset, "val": val_dataset, "test": test_dataset})
     args.initial_text_alpha = text_model.get_alpha().detach().cpu().item()
     if args.group_weight_mode == "learnable":
         # Capture the effective softmax values before the optimizer can update G.
@@ -462,6 +480,7 @@ def main(argv=None):
             record["code_commit"] = args.code_commit
         if args.group_gate == "context_price_only":
             record["text_temporal_pool"] = args.text_temporal_pool
+            record["train_batch_order"] = train_dataloader.fintexts_batch_order
         history.append(record)
 
         with open(history_path, "a", encoding="utf-8") as f:
@@ -513,6 +532,10 @@ def main(argv=None):
                 if args.group_gate == "context_price_only":
                     checkpoint.update(text_temporal_pool=args.text_temporal_pool, split_policy=args.split_policy,
                                       window_evidence=args.window_evidence, temporal_pool_structure=args.temporal_pool_structure)
+                    checkpoint.update(common_initialization=args.common_initialization,
+                                      temporal_initialization_sha256=args.temporal_initialization_sha256,
+                                      source_data_evidence=args.source_data_evidence,
+                                      train_batch_orders=[r["train_batch_order"] for r in history])
 
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
@@ -634,6 +657,9 @@ def main(argv=None):
     if args.group_gate == "context_price_only":
         summary.update(text_temporal_pool=args.text_temporal_pool, split_policy=args.split_policy,
                        window_evidence=args.window_evidence, temporal_pool_structure=args.temporal_pool_structure)
+        summary.update(common_initialization=args.common_initialization, source_data_evidence=args.source_data_evidence,
+                       temporal_initialization_sha256=args.temporal_initialization_sha256,
+                       train_batch_orders=[r["train_batch_order"] for r in history])
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len
         summary["actual_stride"] = model.patch_embedding.stride

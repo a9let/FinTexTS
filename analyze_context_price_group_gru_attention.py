@@ -212,8 +212,8 @@ def train_return_thresholds(train, percentile=90):
     return np.percentile(np.asarray(returns), percentile, axis=0), len(returns)
 
 
-def movement_records(ticker, seed, metadata, predictions):
-    if any(predictions.get(mode) is None for mode in ('last', 'group_gru_attention')):
+def movement_records(ticker, seed, metadata, predictions, required_variants=('last', 'group_gru_attention')):
+    if any(predictions.get(mode) is None for mode in required_variants):
         return [], [{'ticker': ticker, 'seed': seed, 'reason': 'matched normalized predictions unavailable'}]
     last = predictions['last']
     for mode, payload in predictions.items():

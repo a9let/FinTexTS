@@ -11,6 +11,9 @@ HIDDEN_SIZE = 32
 
 
 def temporal_structure(mode):
+    if mode in ("group_han_temporal", "group_han_uniform"):
+        from forecasting_task.models.GroupHANTemporal import han_structure
+        return han_structure(mode)
     if mode == "last":
         return {"mode": mode, "rows": 1, "values": "original_group_embeddings_384"}
     if mode != "group_gru_attention":

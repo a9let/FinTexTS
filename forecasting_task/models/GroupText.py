@@ -265,6 +265,11 @@ class ContextNoveltyTextModel(nn.Module):
 def build_text_model(config, group_weight_mode="learnable"):
     config = dict(config)
     temporal_pool = config.pop("text_temporal_pool", "last")
+    if temporal_pool in ("group_han_temporal", "group_han_uniform"):
+        if group_weight_mode != "context_price_only":
+            raise ValueError("HAN temporal modes require context_price_only")
+        from forecasting_task.models.GroupHANTemporal import GroupHANTemporalTextModel
+        return GroupHANTemporalTextModel(text_temporal_pool=temporal_pool, **config)
     if temporal_pool == "group_gru_attention":
         if group_weight_mode != "context_price_only":
             raise ValueError("group_gru_attention requires context_price_only")

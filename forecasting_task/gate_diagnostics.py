@@ -25,7 +25,7 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
         for batch in loader:
             x, text, x_mark, y_mark, decoder, target = prepare_batch(batch, device, args.pred_len, args.label_len)
             metadata = {key: value.float().to(device) for key, value in batch[6].items()}
-            if getattr(args, "text_temporal_pool", "last") == "group_gru_attention":
+            if getattr(args, "text_temporal_pool", "last") != "last":
                 metadata["text_window"] = text
             film_output = model(x, x_mark, decoder, y_mark)
             output, detail = text_model(film_output, x[:, -1], text[:, -1],
@@ -34,7 +34,8 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
             if "temporal_beta" in detail:
                 from forecasting_task.gru_diagnostics import temporal_records
                 group_records, date_records, component_records = temporal_records(
-                    dataset, batch[5].tolist(), film_output, x[:, -1], output, detail, text_model.get_alpha())
+                    dataset, batch[5].tolist(), film_output, x[:, -1], output, detail, text_model.get_alpha(),
+                    mode=getattr(args, "text_temporal_pool", "group_gru_attention"))
                 temporal_dates.extend(date_records)
                 temporal_components.extend(component_records)
             error = (output - target).double()

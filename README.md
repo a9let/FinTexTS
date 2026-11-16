@@ -804,3 +804,207 @@ foreground and streams START/OK/progress and the final report. Synthetic CPU
 checks exercise GRU masking, gaps, group/batch isolation, causal window alignment,
 common initialization/batch order, checkpoint and contribution reconstruction,
 train-only return thresholds, comparison failures and the mocked 2+60 dispatcher.
+
+## Adapted HAN temporal block
+
+Branch `experiment/context-price-han-temporal` starts from the committed
+`experiment/context-price-group-gru-attention`. The original source checked is
+Hu et al., *Listening to Chaotic Whispers*, WSDM 2018, arXiv:1712.02136v3,
+section 4.2, **Sequential Modeling** and **Temporal Attention**. The paper encodes
+the daily sequence with BiGRU, concatenates directional states and applies:
+
+\[
+h_i=[\overrightarrow h_i;\overleftarrow h_i],\quad
+ o_i=\operatorname{sigmoid}(W_hh_i+b_h),\quad
+ \beta_i=\frac{\exp(\theta_i o_i)}{\sum_j\exp(\theta_j o_j)},\quad
+ V=\sum_i\beta_i h_i.
+\]
+
+Here theta is position dependent. This experiment transfers that temporal
+scheme into FinTexTS OHLC regression. [Original paper, section 4.2](https://arxiv.org/html/1712.02136#S4.SS2).
+
+`--text_temporal_pool` now accepts `group_han_temporal` and `group_han_uniform`.
+The existing last and group_gru_attention modes retain their forwards. Both HAN
+modes use the last 20 input dataset rows ending at t, original float32 presence
+masks before projection, a shared Linear(384,32), and five separate one-layer
+BiGRUs with hidden_size=32 per direction. Present rows are compacted for recurrence,
+then their 64D states are restored to original positions. Both directions skip
+missing rows. The backward direction reads only observations within the input
+window ending at t.
+
+Our explicit scalar-score specialization and the uniform ablation are:
+
+\[
+p_{gi}=Pe_{gi}+p_0,\qquad h_{gi}=\operatorname{BiGRU}_g(p_{g,\mathrm{present}})_i\in\mathbb R^{64},
+\]
+\[
+o_{gi}=\operatorname{sigmoid}(a_g^Th_{gi}+d_g)\in\mathbb R,\qquad
+s_{gi}=\theta_{gi}o_{gi},\qquad
+\beta_{gi}=\operatorname{softmax}_{i:\,m_{gi}=1}(s_{gi}),
+\]
+\[
+\beta^{\mathrm{uniform}}_{gi}=\frac{m_{gi}}{\max(1,\sum_jm_{gj})},\qquad
+z_g=\sum_i\beta_{gi}h_{gi},\quad \widetilde e_g=R_gz_g+q_g.
+\]
+
+Attention uses a Linear(64,1) sigmoid transform and 20 scalar theta parameters
+per group. Theta is initialized to one and indexed by the original row 0..19,
+including gaps. We chose scalar o to make theta_i*o_i a scalar logit; the paper
+does not specify that intermediate dimensionality. The 64-to-384 bridge is a
+separate Linear with bias for each group, with identical architecture in both
+modes. Uniform retains the same scorer parameters and initialization, while its
+weights are determined entirely by masks. At equal parameters both modes have
+identical BiGRU states. Their BiGRUs and bridges train jointly with FiLM, heads
+and price gate. The implementation uses PyTorch GRU and its update-gate/bias
+conventions. Additional temporal parameters are created after the common modules
+inside an isolated RNG scope.
+
+Values are contextual BiGRU states. The existing price gate still uses normalized
+OHLC lag differences [1,5] and ten zero inputs. Date scores use the sigmoid and
+position parameters above. Presence of any text in the window controls the group
+mask after its existing Linear(384,3) head. Empty groups have zero aggregate and
+contribution, including bridge/head biases. A single present row gets weight 1.
+The fusion remains:
+
+\[
+\widehat Y_{h,c}=0.9 F_{h,c}+0.1 X_{t,c}
+ +0.1\sum_g w_g M_g\bigl[W_{g,h}(R_g z_g+q_g)+b_{g,h}\bigr].
+\]
+
+Five groups, FiLM, Adam, scaler, splits, 64-row price inputs and the three OHLC
+forecast horizons keep the preceding experiment's settings. The adapters use
+ready-made daily group embeddings. Intraday article attention, self-paced
+learning and direction classification are outside this transfer's scope.
+This is an adapted temporal-block experiment, with the following date decomposition:
+
+\[
+C_{gih}=0.1w_g\beta_{gi}\bigl[W_{g,h}(R_g h_{gi}+q_g)+b_{g,h}\bigr].
+\]
+
+Validation diagnostics from the best checkpoint verify sum_i C_gih equals the
+masked group contribution and reconstruct all OHLC predictions with the FiLM
+and anchor components. CSVs retain original dates, masks, attention weights,
+group weights and signed date/group contributions. The date representation is
+labelled `contextual_BiGRU_state_projected_64_to_384`. These contributions describe
+contextual hidden states. Removing a source date changes states in both directions
+and attention, so the decomposition does not isolate a news item's effect.
+
+### Controls and evidence
+
+New runs save the temporal structure and code SHA, existing validation/test
+window_evidence, hashes of actual group embeddings/prices/dates for all splits,
+and initial FiLM/head/price-gate state hashes. Each epoch records a hash of the
+actual training indices with batch boundaries; checkpoint and summary retain the
+order histories. These hashes consume no random numbers. Initial state/data
+proofs must agree across conditions, and actual batch orders must agree on all
+shared epochs up to the earlier stopping time. Parquet file SHA is recorded too;
+semantic input hashes determine whether equivalent source arrays match.
+The temporal/uniform pair also requires identical code SHA and initial
+BiGRU/bridge/scorer parameter hashes, saved as temporal_initialization_sha256.
+
+`analyze_context_price_han_temporal.py` reuses saved last and Group-GRU from
+`context_price_group_gru_attention_10_v1` only when configurations, source text,
+common initialization, actual batch order, windows, targets, dates and scaler
+are confirmed. Missing historical evidence is explicitly partial and disables
+paired comparisons/selection with that control. It never fills historical proof
+from current-code assumptions. Group-GRU is an additional reference because its
+date weights and pooled representations both differ from this HAN transfer.
+
+The primary temporal-vs-uniform comparison requires 30 runs per mode and full
+matched evidence. Reports include per-run/ticker/seed validation MSE, test
+MSE/MAE, sample std across seed means, paired differences and ticker wins.
+Selection uses validation MSE, with last included only after strict verification.
+Test and strong-movement diagnostics do not enter selection. When a strict last
+control is available, the existing train-only 90th-percentile Close-return
+threshold diagnostic is reused. A strong price movement establishes a numerical
+subset for error analysis; evidence of anomalous news requires a separate study.
+Existing report directories and training outputs are preserved.
+
+### Queue and astra commands
+
+`run_context_price_han_temporal_60.sh` launches separate one-epoch NVDA seed7 checks
+for the two HAN modes, followed by exactly 60 main runs, two modes x AAPL ABBV
+ABT ACN ADBE ADI AMAT AMD AMGN AMZN x seeds 7/17/27. Settings match the preceding
+Group-GRU queue (seq64, label16, pred3, batch32, Adam .001, max50, patience10,
+fixed alpha .1). Data, CUDA checks, thread limits, SHA/script recording,
+overwrite protection, log tails and artifact checks follow the existing queue.
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_han_temporal_10_v1/
+  checks/{group_han_temporal,group_han_uniform}/NVDA/seed7/{train.log,output/}
+  full/{group_han_temporal,group_han_uniform}/{ticker}/seed{seed}/{train.log,output/}
+```
+
+Once the branch is committed and published, on astra from the host Git checkout,
+use the container's existing `/workspace/variants` mount. The commands obtain its
+actual host source instead of assuming a host mount path.
+
+```bash
+set -euo pipefail
+git fetch origin
+VARIANTS_HOST=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace/variants"}}{{.Source}}{{end}}{{end}}' kondyurin-fintexts-compare)
+test -n "$VARIANTS_HOST"
+WORKTREE="$VARIANTS_HOST/context-price-han-temporal"
+git worktree add --detach "$WORKTREE" origin/experiment/context-price-han-temporal
+CODE_COMMIT=$(git -C "$WORKTREE" rev-parse HEAD)
+CONTAINER_CODE=/workspace/variants/context-price-han-temporal
+
+docker exec kondyurin-fintexts-compare python -c \
+  'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'
+docker exec -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
+  kondyurin-fintexts-compare bash run_context_price_han_temporal_60.sh
+docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
+  python analyze_context_price_han_temporal.py
+```
+
+If saved last is partial, explicitly launch the optional matched control:
+
+```bash
+docker exec -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
+  kondyurin-fintexts-compare bash run_context_price_han_temporal_60.sh matched-last
+docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
+  python analyze_context_price_han_temporal.py \
+    --last_root /auto/datasets/kondyurin/FinTexTS/runs/context_price_han_temporal_10_v1_matched_last
+```
+
+This optional queue uses one separate NVDA check plus 30 last runs, a distinct
+results directory, and an explicit CLI option. The default 2+60 queue never
+launches it. Default analysis reports go under diagnostics/saved_last, and the
+explicit last_root produces diagnostics/matched_last, allowing both audits.
+
+```mermaid
+flowchart LR
+    E["20 input group-embedding rows"] --> M["Original daily masks"]
+    E --> P["Shared Linear 384 to 32"]
+    P --> B["Five masked BiGRUs, 32 per direction"]
+    M --> B
+    B --> H["Contextual states, 64D"]
+    H --> S["Sigmoid content score x original-position theta"]
+    M --> U["Uniform over present dates"]
+    S --> Z["Weighted sum of 64D states"]
+    U --> Z
+    H --> Z
+    Z --> R["Five Linear 64 to 384 bridges"]
+    R --> L["Five existing Linear 384 to 3 heads"]
+    L --> D["Mask and group-weighted delta"]
+    M --> D
+    X["64 normalized OHLC rows"] --> F[FiLM]
+    X --> G["Original price gate, lags 1 and 5"]
+    G --> D
+    F --> O["0.9 FiLM + 0.1 last price + 0.1 delta"]
+    X --> O
+    D --> O
+```
+
+### Короткая запись для PDF
+
+- **Что делали в статье** — BiGRU по дневной последовательности, sigmoid-оценка,
+  параметр позиции и взвешенная сумма скрытых состояний для классификации тренда.
+- **Что перенесли** — временной блок в двух вариантах, обучаемые и равномерные
+  веса по датам, с сохранением исходных позиций при пропусках.
+- **Что изменили и почему** — 20 входных строк и пять групп MiniLM-эмбеддингов,
+  скалярный scorer и мост 64→384 для совместимости с существующими OHLC-головами,
+  FiLM, gate и alpha=.1; задача и подготовка данных остаются в FinTexTS.
+- **Как проверяем** — парные запуски, маски двух направлений, формула внимания,
+  градиенты, общий старт и батчи, checkpoint и сумма вкладов; выбор по validation,
+  строгое подтверждение сохранённых контролей. Результаты обучения пока не внесены.
