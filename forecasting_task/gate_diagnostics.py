@@ -19,13 +19,24 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
     root = Path(args.logdir)
     table_path = root / "validation_group_diagnostics.csv"
     rows, dates, weights, contributions = [], [], [], []
+    temporal_dates, temporal_components = [], []
     squared_sum, absolute_sum, elements, next_index = 0., 0., 0, 0
     with torch.no_grad():
         for batch in loader:
             x, text, x_mark, y_mark, decoder, target = prepare_batch(batch, device, args.pred_len, args.label_len)
             metadata = {key: value.float().to(device) for key, value in batch[6].items()}
-            output, detail = text_model(model(x, x_mark, decoder, y_mark), x[:, -1], text[:, -1],
+            if getattr(args, "text_temporal_pool", "last") == "group_gru_attention":
+                metadata["text_window"] = text
+            film_output = model(x, x_mark, decoder, y_mark)
+            output, detail = text_model(film_output, x[:, -1], text[:, -1],
                                         price_window=x, return_details=True, **metadata)
+            group_records = {}
+            if "temporal_beta" in detail:
+                from forecasting_task.gru_diagnostics import temporal_records
+                group_records, date_records, component_records = temporal_records(
+                    dataset, batch[5].tolist(), film_output, x[:, -1], output, detail, text_model.get_alpha())
+                temporal_dates.extend(date_records)
+                temporal_components.extend(component_records)
             error = (output - target).double()
             squared_sum += error.square().sum().item()
             absolute_sum += error.abs().sum().item()
@@ -47,6 +58,7 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
                               "pair_available": int(detail["pair_available"][sample, group_index]),
                               "pair_available_used": int(detail["pair_available_used"][sample, group_index]),
                               "weight": float(detail["weights"][sample, group_index])}
+                    record.update(group_records.get((index, group), {}))
                     for horizon in range(args.pred_len):
                         record[f"head_h{horizon + 1}"] = float(detail["heads"][sample, group_index, horizon])
                         record[f"contribution_h{horizon + 1}"] = float(detail["contributions"][sample, group_index, horizon])
@@ -81,5 +93,9 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
     for horizon in range(args.pred_len):
         plot(contributions[:, :, horizon], f"Validation group contributions, horizon {horizon + 1}",
              "Contribution to normalized OHLC prediction", f"validation_contributions_h{horizon + 1}.png")
-    return {"table": table_path.name, "plots": plots, "windows": next_index, "rows": len(rows),
-            "mse": mse, "mae": mae, "checkpoint": "best_checkpoint.pt"}
+    result = {"table": table_path.name, "plots": plots, "windows": next_index, "rows": len(rows),
+              "mse": mse, "mae": mae, "checkpoint": "best_checkpoint.pt"}
+    if temporal_dates:
+        from forecasting_task.gru_diagnostics import write_temporal_tables
+        result.update(write_temporal_tables(root, temporal_dates, temporal_components))
+    return result

@@ -628,3 +628,179 @@ also printed. Tests cover pair-availability invariance with a nonzero gate,
 presence masking, zero gradients in the ten unused columns, matched initialization
 and batching, checkpoint/diagnostic restoration, a mocked 1+30 queue, statistical
 aggregation, mismatch exclusions, read-only analysis and validation-only selection.
+
+## Group-GRU temporal attention with a matched last control
+
+Branch `experiment/context-price-group-gru-attention` starts from
+`experiment/context-price-only`. The original implementation uses five
+independent `Linear(384,3)` heads, the last group embedding, and a zero-initialized
+`Linear(18,5)` price gate. Its eight price features are lag-1 and lag-5 differences
+of normalized OHLC, followed by ten zero entries. The original queue sets
+FiLM, seq_len=64, label_len=16, pred_len=3, batch_size=32, Adam lr=0.001,
+max_epochs=50, patience=10 and fixed alpha=0.1.
+
+`--text_temporal_pool last` retains that forward and is the default.
+`--text_temporal_pool group_gru_attention` requires `context_price_only` and an
+input window of at least 20 rows. It selects exactly the last 20 input rows,
+including the input end date. These are dataset rows. The first available text
+in this slice has gap zero, and later gaps count rows from the preceding
+available text in this same slice. Presence is evaluated with float32 L1 >= 1e-6
+before projection. Each missing row preserves the preceding GRU state and has
+zero attention weight.
+
+For each group g in macro, sector, targetCompany, relatedCompany, filing:
+
+```text
+c_t = concat(X[-1] - X[-2], X[-1] - X[-6])                 # OHLC order
+w = softmax(price_gate(concat(c_t, zeros(5), zeros(5))))
+q[g,i] = concat(shared_Linear_384_to_32(e[g,i]), gap[g,i]/20)
+h[g,i] = GRU_g(q[g,i], preceding_state)                   # present rows
+age[i] = (t-i)/19
+score[g,i] = v_g^T tanh(A_g h[g,i] + B_g c_t + D_g age[i] + b_g)
+beta[g,:] = masked_softmax_over_present_dates(score[g,:])
+pooled[g] = sum_i beta[g,i] * original_embedding[g,i]
+present_window[g] = any_i present[g,i]
+delta[h] = sum_g w[g] * present_window[g] * head_g(pooled[g])[h]
+prediction[h,:] = 0.9*FiLM[h,:] + 0.1*last_price[:] + 0.1*delta[h]
+```
+
+The shared projection is `Linear(384,32)` with bias. Each group has its own
+one-layer, unidirectional `GRU(input_size=33, hidden_size=32)` and its own
+32-dimensional additive attention. Attention keys use the GRU states, original
+8-dimensional price context and scalar age. Values retain the original 384D
+embeddings and their norms. Beta is shared across forecast horizons. The existing
+five heads receive the pooled values. A sole available date has beta=1. Empty
+groups have zero aggregate, beta and contribution after the head, including its
+bias. Group presence follows the original daily masks even if pooled vectors
+cancel. A group can contribute through earlier texts when the current row is empty.
+
+The new projection/GRUs/attention use PyTorch default initialization with zero
+additive attention bias, inside an isolated RNG scope after the original heads
+and price gate have been created. Common FiLM/head/gate parameters and train
+batch order match across conditions at the same seed. Initial predictions may
+differ because the heads receive different embeddings. The projection, all GRUs,
+attention, existing heads, gate and FiLM are optimized jointly by the existing Adam.
+
+```mermaid
+flowchart LR
+    P["64 normalized OHLC rows"] --> F[FiLM]
+    P --> C["Original price context, lags 1 and 5"]
+    C --> G["Original price gate and group softmax"]
+    E["Last 20 input rows, five original group embeddings"] --> M[Daily presence masks]
+    E --> Q["Shared Linear 384 to 32"]
+    Q --> R["Five independent GRUs, input 33, hidden 32"]
+    M --> R
+    R --> A["Five additive temporal attentions"]
+    C --> A
+    M --> A
+    A --> V["Weighted sum of original 384D values"]
+    E --> V
+    V --> H["Five existing Linear 384 to 3 heads"]
+    M --> W[Window presence masks]
+    H --> D[Masked and group-weighted delta]
+    W --> D
+    G --> D
+    F --> O["0.9 FiLM + 0.1 last price + 0.1 delta"]
+    P --> O
+    D --> O
+```
+
+Args, history, checkpoint and summary identify the temporal mode. Args,
+checkpoint and summary include the layer structure, full code SHA, explicit split
+policy and fingerprints of normalized price inputs, future targets, input-end
+dates and target dates for both validation and test. Checkpoints also retain the
+train-only scaler, optimizer and every trainable parameter. These shared-window
+fingerprints must match in the two conditions. Their text slices are explicitly
+recorded as one row for last and 20 rows for Group-GRU.
+
+Validation diagnostics restore the checkpoint selected by lowest validation MSE.
+`validation_group_diagnostics.csv` retains the group weights and signed group
+contributions and adds the 20 dates, daily masks and beta for Group-GRU.
+`validation_text_dates.csv` contains each window/group/date, scaled age and gap,
+mask, beta, price group weight and signed date/group contributions for h=1,2,3.
+`validation_prediction_components.csv` records FiLM, anchor and total text
+components for each horizon and OHLC channel. Runtime checks verify both sums:
+
+```text
+C[g,i,h] = alpha*w[g]*beta[g,i]*(W[g,h] @ e[g,i] + b[g,h])
+sum_i C[g,i,h] = group_contribution[g,h]
+prediction[h,:] = (1-alpha)*FiLM[h,:] + alpha*last_price[:] + sum_gi C[g,i,h]
+```
+
+These are decompositions of the model output at its computed weights. Removing
+one date changes GRU states and attention and requires a new forward pass.
+The recorded contribution therefore does not identify the effect of deletion or
+establish that a news item caused a price movement.
+
+`run_context_price_group_gru_attention_60.sh` first runs separate one-epoch
+NVDA seed7 checks for last and group_gru_attention, followed by exactly 60 full
+runs, both modes ? AAPL ABBV ABT ACN ADBE ADI AMAT AMD AMGN AMZN ? seeds 7/17/27.
+Both conditions start from scratch in this branch. The dispatcher uses the old
+price-only queue's settings, CUDA preflight, OMP/MKL threads=2, full SHA with
+CODE_COMMIT fallback, script copy, overwrite guards, log tails and nonempty
+summary/checkpoint checks. It reports completed=N/60 and ALL 60 RUNS COMPLETED.
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_group_gru_attention_10_v1/
+  checks/{last,group_gru_attention}/NVDA/seed7/{train.log,output/}
+  full/{last,group_gru_attention}/{ticker}/seed{7,17,27}/{train.log,output/}
+```
+
+`analyze_context_price_group_gru_attention.py` reads saved configurations and
+metrics on CPU. The main comparison requires 30 unique ticker/seed checkpoints
+per condition, matching settings, code SHA, train-only scaler, split policy,
+full persisted validation/test window fingerprints, and saved normalized test
+inputs and targets. A mismatch blocks selection and the program exits with an
+error after writing its report. The original FiLM-with-text baseline is read
+from `film_compare_50ep_v1/full/baseline`. Its saved args and artifacts determine
+comparability. Historical missing fields are listed under `partial`; detected
+mismatches suppress relative gains and the 0.8 baseline target for that comparison.
+Published launcher text is not used to infer historical run settings.
+
+Reports are created exclusively under `diagnostics/comparison/`, preserving prior
+reports and training artifacts. They include per-run and per-ticker validation
+MSE/test MSE/MAE, seed means, mean and sample std between the three seed means,
+paired differences, wins after averaging seeds, test MSE reduction and
+`0.8 * baseline_test_mse` on the complete comparable cohort. Baseline comparisons
+with partial evidence are labelled as such. The selected model uses only overall
+validation MSE from the new matched pair.
+
+When aligned normalized test outputs and targets are available, the analyzer
+also reports strong-movement errors. For each ticker/horizon it derives the 90th
+percentile of `abs(Close[t+h]/Close[t] - 1)` using complete train windows in the
+original price scale, then applies that fixed threshold to test. CSVs record the
+threshold, train/selected/total window counts, normalized OHLC MSE and the selected
+windows' share of matched-last squared error at that horizon. Seed tables pool
+SSE over all selected OHLC elements and keep horizons separate. These diagnostics
+are excluded from model selection. Aggregate MSE and beta do not establish anomalies.
+
+After this branch is committed and published, execute the following on astra
+from the existing host Git checkout. The dedicated detached worktree is copied
+to a fresh code directory in the existing container, and CODE_COMMIT records the
+host commit even when the worktree's Git metadata is inaccessible inside Docker.
+
+```bash
+git fetch origin
+WORKTREE=/auto/datasets/kondyurin/FinTexTS/worktrees/context-price-group-gru-attention
+git worktree add --detach "$WORKTREE" origin/experiment/context-price-group-gru-attention
+CODE_COMMIT=$(git -C "$WORKTREE" rev-parse HEAD)
+CONTAINER_CODE=/tmp/fintexts-context-price-group-gru-attention
+docker exec kondyurin-fintexts-compare test ! -e "$CONTAINER_CODE"
+docker cp "$WORKTREE" "kondyurin-fintexts-compare:$CONTAINER_CODE"
+
+docker exec kondyurin-fintexts-compare python -c \
+  'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'
+
+docker exec -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
+  kondyurin-fintexts-compare bash run_context_price_group_gru_attention_60.sh
+
+docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
+  python analyze_context_price_group_gru_attention.py
+```
+
+Both the worktree and container-code destination must be fresh. The dataset and
+results use the existing `/auto/datasets` volume. The sequence above runs in the
+foreground and streams START/OK/progress and the final report. Synthetic CPU
+checks exercise GRU masking, gaps, group/batch isolation, causal window alignment,
+common initialization/batch order, checkpoint and contribution reconstruction,
+train-only return thresholds, comparison failures and the mocked 2+60 dispatcher.

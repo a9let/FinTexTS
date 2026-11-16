@@ -10,6 +10,12 @@ TEXT_GROUPS = ("macro", "sector", "targetCompany", "relatedCompany", "filing")
 EMBEDDING_SIZE = 384
 
 
+def price_context(price_window):
+    """Original normalized OHLC differences, in lag-1 then lag-5 order."""
+    return torch.cat((price_window[:, -1] - price_window[:, -2],
+                      price_window[:, -1] - price_window[:, -6]), dim=-1)
+
+
 def validate_initial_group_weights(values, num_groups):
     """Validate ordered CLI/model weights without consuming any random numbers."""
     if values is None:
@@ -220,7 +226,7 @@ class ContextNoveltyTextModel(nn.Module):
         return state
 
     def forward(self, price_output, last_price, embeddings, *, price_window, novelty,
-                pair_available, return_details=False):
+                pair_available, return_details=False, group_present=None):
         batch = embeddings.shape[0]
         if embeddings.ndim != 3 or embeddings.shape[1:] != (5, 384):
             raise ValueError("Expected last-day embeddings [batch, 5, 384]")
@@ -231,8 +237,7 @@ class ContextNoveltyTextModel(nn.Module):
             raise ValueError("Price context requires at least six input OHLC rows")
         if novelty.shape != (batch, 5) or pair_available.shape != (batch, 5):
             raise ValueError("Expected novelty and pair_available [batch,5]")
-        context = torch.cat((price_window[:, -1] - price_window[:, -2],
-                             price_window[:, -1] - price_window[:, -6]), dim=-1)
+        context = price_context(price_window)
         novelty_used = torch.zeros_like(novelty) if self.group_gate in ("context_no_novelty", "context_price_only") else novelty
         pair_available_used = torch.zeros_like(pair_available) if self.group_gate == "context_price_only" else pair_available
         features = torch.cat((context, novelty_used, pair_available_used), dim=-1)
@@ -240,7 +245,9 @@ class ContextNoveltyTextModel(nn.Module):
             weights = embeddings.new_full((batch, 5), 0.2)
         else:
             weights = torch.softmax(self.gate(features), dim=-1)
-        present = embeddings.abs().sum(dim=-1) >= 1e-6
+        present = embeddings.abs().sum(dim=-1) >= 1e-6 if group_present is None else group_present
+        if present.shape != (batch, 5) or present.dtype != torch.bool:
+            raise ValueError("Expected boolean group presence [batch,5]")
         heads = torch.stack([self.group_mlps[group](embeddings[:, index])
                              for index, group in enumerate(TEXT_GROUPS)], dim=1)
         masked = heads * present.unsqueeze(-1).to(heads.dtype)
@@ -256,6 +263,20 @@ class ContextNoveltyTextModel(nn.Module):
 
 
 def build_text_model(config, group_weight_mode="learnable"):
+    config = dict(config)
+    temporal_pool = config.pop("text_temporal_pool", "last")
+    if temporal_pool == "group_gru_attention":
+        if group_weight_mode != "context_price_only":
+            raise ValueError("group_gru_attention requires context_price_only")
+        from forecasting_task.models.GroupGRUAttention import GroupGRUAttentionTextModel
+        return GroupGRUAttentionTextModel(**config)
+    if temporal_pool != "last":
+        raise ValueError(f"Unknown text_temporal_pool: {temporal_pool}")
+    structure = config.pop("temporal_pool_structure", None)
+    if structure is not None:
+        from forecasting_task.models.GroupGRUAttention import temporal_structure
+        if structure != temporal_structure("last"):
+            raise ValueError("Unsupported saved last pooling structure")
     if "group_gate" in config:
         expected = "fixed_uniform" if config["group_gate"] == "static" else config["group_gate"]
         if group_weight_mode != expected:
