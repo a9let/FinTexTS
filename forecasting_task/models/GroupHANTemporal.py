@@ -35,7 +35,8 @@ class HANDateAttention(nn.Module):
         self.position = nn.Parameter(torch.ones(WINDOW))
 
     def forward(self, states, present):
-        scores = self.position * torch.sigmoid(self.transform(states).squeeze(-1))
+        # Short windows retain the suffix of the original 20 positional parameters.
+        scores = self.position[-states.shape[1]:] * torch.sigmoid(self.transform(states).squeeze(-1))
         scores = scores.masked_fill(~present, torch.finfo(scores.dtype).min)
         beta = torch.softmax(scores, dim=1) * present.to(scores.dtype)
         return beta / beta.sum(1, keepdim=True).clamp_min(torch.finfo(beta.dtype).tiny)
@@ -56,19 +57,22 @@ def masked_bigru(gru, values, present):
 
 
 class GroupHANPool(nn.Module):
-    def __init__(self, mode, hidden_size=32, output_projection=True):
+    def __init__(self, mode, hidden_size=32, output_projection=True, window_size=WINDOW):
         super().__init__()
         self.mode = mode
         self.output_projection = output_projection
+        if window_size not in (5, 10, WINDOW):
+            raise ValueError('HAN window_size must be 5, 10 or 20')
+        self.window_size = window_size
         self.projection = nn.Linear(384, 32)
         self.grus = nn.ModuleDict({g: nn.GRU(32, hidden_size, batch_first=True, bidirectional=True) for g in TEXT_GROUPS})
         self.attentions = nn.ModuleDict({g: HANDateAttention(2 * hidden_size) for g in TEXT_GROUPS})
         self.output_projections = nn.ModuleDict({g: nn.Linear(2 * hidden_size, 384) for g in TEXT_GROUPS}) if output_projection else nn.ModuleDict()
 
     def forward(self, text_window, exclude_current=False):
-        if text_window.ndim != 4 or text_window.shape[1] < WINDOW or text_window.shape[2:] != (5, 384):
-            raise ValueError("Expected text window [batch,time>=20,5,384]")
-        original = text_window[:, -WINDOW:].float()
+        if text_window.ndim != 4 or text_window.shape[1] < self.window_size or text_window.shape[2:] != (5, 384):
+            raise ValueError(f"Expected text window [batch,time>={self.window_size},5,384]")
+        original = text_window[:, -self.window_size:].float()
         if not torch.isfinite(original).all():
             raise ValueError("Text history must be finite")
         present = original.abs().sum(-1) >= 1e-6
@@ -96,7 +100,7 @@ class GroupHANPool(nn.Module):
         details = {
             "temporal_beta": torch.stack(betas, 2), "temporal_present": present,
             "temporal_states": torch.stack(states_by_group, 2), "date_values": torch.stack(values_by_group, 2),
-            "temporal_ages": torch.arange(19, -1, -1, device=original.device, dtype=original.dtype) / 19,
+            "temporal_ages": torch.arange(self.window_size - 1, -1, -1, device=original.device, dtype=original.dtype) / 19,
             "pooled_embeddings": pooled}
         if exclude_current:
             details["temporal_source_present"] = source_present

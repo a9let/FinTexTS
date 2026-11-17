@@ -1158,3 +1158,100 @@ After the queue completes:
 docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
   python analyze_context_price_han_head_ablation.py
 ```
+
+## HAN: длина текстового окна 5 / 10 / 20
+
+Ветка `experiment/context-price-han-window` добавляет только
+`--text_temporal_pool han_h16_linear_w5` и `han_h16_linear_w10`.
+Оба режима обучаются с нуля. Сохранённые `han_h16_linear` (HAN-20) и
+`last_matched` из `context_price_han_head_ablation_10_v1` используются
+как контроли и автоматически не переобучаются.
+
+HAN-5 берёт строки t−4,…,t, HAN-10 — t−9,…,t. Это строки датасета,
+а не календарные дни. Сохраняются общая проекция MiniLM 384→32,
+пять независимых BiGRU с hidden_size=16 на направление, конкатенация
+состояний размерности 32, прежняя формула HAN attention и отдельные
+прямые головы Linear(32→3). Из исходных 20 параметров позиции
+используются соответственно индексы 15…19 или 10…19: позиция t всегда 19.
+Все 20 параметров остаются в checkpoint, поэтому веса совместимы с HAN-20.
+Пропуски исключаются из рекуррентной последовательности; исходные позиции
+сохраняются. Пустая группа целиком маскируется после головы, включая bias.
+
+```text
+beta_gi = masked_softmax_i(theta_g,position(i) * sigmoid(v_g @ h_gi + b_g))
+summary_g = sum_i beta_gi * h_gi
+delta_gh = present_g * (W_gh @ summary_g + bias_gh)
+prediction_h = 0.9 * FiLM_h + 0.1 * last_price + 0.1 * sum_g price_weight_g * delta_gh
+```
+
+Ценовое окно FiLM=64, gate [1,5], alpha=0.1, blend, пять групп,
+label_len=16, pred_len=3, batch_size=32, Adam lr=0.001, максимум 50 эпох,
+patience=10, scaler и разбиения прежние. При одном seed параметры FiLM,
+голов, BiGRU и attention совпадают с HAN-20, порядок батчей также сохраняется.
+Прогнозы при разных текстовых окнах могут различаться уже до обучения.
+
+`run_context_price_han_window_60.sh` переиспользует проверяемый диспетчер HAN:
+два NVDA seed7 smoke check на одной эпохе, затем 60 основных запусков
+(2 окна × AAPL ABBV ABT ACN ADBE ADI AMAT AMD AMGN AMZN × seeds 7,17,27).
+CUDA, SHA через Git/`CODE_COMMIT`, настройки и артефакты проверяются до
+подтверждения успеха. Подтверждённые завершённые запуски можно пропустить
+при возобновлении; неполные или несовпадающие результаты останавливают очередь.
+Сохраняются время по режимам и ETA без жёсткого ограничения длительности.
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_han_window_10_v1/
+  checks/{mode}/NVDA/seed7/{train.log,completed.json,output/}
+  full/{mode}/{ticker}/seed{seed}/{train.log,completed.json,output/}
+  diagnostics/window_comparison/
+```
+
+В args/summary/checkpoint сохраняются режим, структура и исходные индексы
+позиций, SHA, отпечатки источников, окон, дат, целей и начальных параметров,
+история фактического порядка батчей. Диагностика лучшего validation checkpoint
+содержит даты, маски, веса HAN, исходный индекс позиции и точное разложение
+линейной головы по датам с учётом bias, а также итоговые вклады групп.
+
+`analyze_context_price_han_window.py` сравнивает HAN-5, HAN-10, HAN-20 и
+last_matched без обучения и inference. Метрики берутся из summary; сохранённые
+test outputs проверяются на соответствие test MSE/MAE. Отчёт включает каждый
+запуск, средние по 10 акциям для каждого seed, mean/sample std между seed,
+парные разницы, проценты улучшения и победы по акциям после усреднения seeds.
+`window_verification.csv` отдельно для каждой пары различает `full`, `partial`,
+`mismatch`, `not_checked`: проверяются исходный Parquet и содержимое групп,
+ценовые окна/цели/даты validation и test, scaler, конфигурация, общая
+инициализация и порядок батчей на общих эпохах. Для трёх HAN-окон дополнительно
+сверяются начальные BiGRU, attention, проекция и прямые головы.
+Неподтверждённые пары не получают строгих парных выводов или процентов.
+Если HAN-20 не подтверждён, выбор явно ограничивается подтверждёнными окнами
+5/10. Выбор всегда основан только на validation MSE. Существующий отчёт
+не перезаписывается; для повторного анализа укажите новый `--output_dir`.
+
+После отдельного коммита и публикации ветки, на astra из host Git checkout:
+
+```bash
+set -euo pipefail
+git fetch origin
+VARIANTS_HOST=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace/variants"}}{{.Source}}{{end}}{{end}}' kondyurin-fintexts-compare)
+test -n "$VARIANTS_HOST"
+WORKTREE="$VARIANTS_HOST/context-price-han-window"
+git worktree add --detach "$WORKTREE" origin/experiment/context-price-han-window
+CODE_COMMIT=$(git -C "$WORKTREE" rev-parse HEAD)
+CONTAINER_CODE=/workspace/variants/context-price-han-window
+
+docker exec kondyurin-fintexts-compare python -c \
+  'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'
+
+docker exec -d -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
+  kondyurin-fintexts-compare bash -lc '
+    set -euo pipefail
+    mkdir -p /auto/datasets/kondyurin/FinTexTS/runs/context_price_han_window_10_v1
+    exec bash run_context_price_han_window_60.sh >> /auto/datasets/kondyurin/FinTexTS/runs/context_price_han_window_10_v1/queue.log 2>&1
+  '
+
+docker exec kondyurin-fintexts-compare tail -n 60 -f \
+  /auto/datasets/kondyurin/FinTexTS/runs/context_price_han_window_10_v1/queue.log
+
+# После завершения очереди:
+docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
+  python analyze_context_price_han_window.py
+```

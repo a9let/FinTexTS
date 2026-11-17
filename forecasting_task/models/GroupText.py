@@ -268,7 +268,7 @@ class ContextNoveltyTextModel(nn.Module):
 def build_text_model(config, group_weight_mode="learnable"):
     config = dict(config)
     temporal_pool = config.pop("text_temporal_pool", "last")
-    if temporal_pool in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"):
+    if temporal_pool in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual", "han_h16_linear_w5", "han_h16_linear_w10"):
         if group_weight_mode != "context_price_only":
             raise ValueError("HAN head ablations require context_price_only")
         from forecasting_task.models.HANHeadAblation import HANHeadAblationTextModel

@@ -74,7 +74,7 @@ def parse_args(argv=None):
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
     parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
     parser.add_argument("--text_temporal_pool", choices=["last", "group_gru_attention", "group_han_temporal", "group_han_uniform",
-                        "last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"], default="last")
+                        "last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual", "han_h16_linear_w5", "han_h16_linear_w10"], default="last")
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
         help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
@@ -391,8 +391,8 @@ def main(argv=None):
         args.common_initialization = common_initialization(model, text_model)
         args.temporal_initialization_sha256 = state_fingerprint(text_model.temporal_pool) if hasattr(text_model, "temporal_pool") else None
         args.source_data_evidence = source_data_evidence({"train": train_dataset, "val": val_dataset, "test": test_dataset})
-        from forecasting_task.models.HANHeadAblation import ABLATION_MODES, initial_prediction_evidence
-        if args.text_temporal_pool in ABLATION_MODES:
+        from forecasting_task.models.HANHeadAblation import ABLATION_MODES, HAN_WINDOW_MODES, initial_prediction_evidence
+        if args.text_temporal_pool in (*ABLATION_MODES, *HAN_WINDOW_MODES):
             args.head_ablation_initialization = {
                 "encoder_input_projection_sha256": state_fingerprint(text_model.temporal_pool.projection) if hasattr(text_model, "temporal_pool") else None,
                 "encoder_sha256": args.temporal_initialization_sha256}

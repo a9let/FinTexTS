@@ -11,7 +11,7 @@ HIDDEN_SIZE = 32
 
 
 def temporal_structure(mode, pred_len=3):
-    if mode in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"):
+    if mode in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual", "han_h16_linear_w5", "han_h16_linear_w10"):
         from forecasting_task.models.HANHeadAblation import head_ablation_structure
         return head_ablation_structure(mode, pred_len)
     if mode in ("group_han_temporal", "group_han_uniform"):

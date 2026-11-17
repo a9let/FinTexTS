@@ -15,7 +15,7 @@ from analyze_blend_price_anchor import execution_device, film_module
 from analyze_persistence_baseline import Run
 from forecasting_task.experiment_evidence import common_initialization, state_fingerprint
 from forecasting_task.models.GroupText import build_text_model
-from forecasting_task.models.HANHeadAblation import ABLATION_MODES, head_ablation_structure
+from forecasting_task.models.HANHeadAblation import ABLATION_MODES, HAN_WINDOW_MODES, head_ablation_structure
 
 
 DEFAULT_RESULTS = han.RUNS / 'context_price_han_head_ablation_10_v1'
@@ -34,7 +34,7 @@ class BridgePartialError(ValueError):
 def inspect(run, cache):
     result = han.inspect(run, cache)
     row, metadata, payload, evidence = result
-    if row['comparable'] and run.variant in ABLATION_MODES:
+    if row['comparable'] and run.variant in (*ABLATION_MODES, *HAN_WINDOW_MODES):
         try:
             args = metadata['args']
             summary = json.loads((run.output / 'summary.json').read_text())

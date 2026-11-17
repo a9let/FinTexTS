@@ -37,7 +37,7 @@ def temporal_records(dataset, indices, film_output, last_price, output, detail, 
                                     "text_window_present": json.dumps(mask.astype(int).tolist()),
                                     "text_window_beta": json.dumps(beta.tolist()),
                                     "available_dates": int(mask.sum())}
-            if mode in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"):
+            if mode in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual", "han_h16_linear_w5", "han_h16_linear_w10"):
                 groups[index, group]["date_decomposition"] = "date_contributions" in arrays
             if "current_contributions" in arrays:
                 groups[index, group]["current_present"] = int(arrays["current_present"][sample, group_index])
@@ -47,13 +47,15 @@ def temporal_records(dataset, indices, film_output, last_price, output, detail, 
             for row, date in enumerate(row_dates):
                 record = {"window_index": index, "input_end_date": row_dates[-1], "group": group,
                           "date": date, "age": float(arrays["temporal_ages"][row])}
+                if mode in ("han_h16_linear_w5", "han_h16_linear_w10"):
+                    record["original_position_index"] = 20 - window + row
                 if "temporal_gaps" in arrays:
                     record["gap_scaled"] = float(arrays["temporal_gaps"][sample, row, group_index])
                 record.update(present=int(mask[row]), beta=float(beta[row]),
                               group_weight=float(arrays["weights"][sample, group_index]))
                 if "temporal_gaps" not in arrays:
                     record["representation"] = "contextual_BiGRU_state_projected_64_to_384"
-                    if mode in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"):
+                    if mode in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual", "han_h16_linear_w5", "han_h16_linear_w10"):
                         record["representation"] = "current_summary" if mode == "last_matched" else "contextual_BiGRU_state"
                         record["decomposition_kind"] = "linear_date_contributions" if "date_contributions" in arrays else "attention_weights_only"
                 if "temporal_source_present" in arrays:
