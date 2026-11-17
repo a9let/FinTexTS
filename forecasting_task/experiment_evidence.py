@@ -7,9 +7,11 @@ from pathlib import Path
 import numpy as np
 
 
-def state_fingerprint(module):
+def state_fingerprint(module, exclude_prefixes=()):
     digest = hashlib.sha256()
     for name, tensor in sorted(module.state_dict().items()):
+        if any(name.startswith(prefix) for prefix in exclude_prefixes):
+            continue
         value = tensor.detach().cpu().contiguous().numpy()
         digest.update(json.dumps([name, str(value.dtype), list(value.shape)]).encode())
         digest.update(value.tobytes())

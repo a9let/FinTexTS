@@ -1008,3 +1008,153 @@ flowchart LR
 - **Как проверяем** — парные запуски, маски двух направлений, формула внимания,
   градиенты, общий старт и батчи, checkpoint и сумма вкладов; выбор по validation,
   строгое подтверждение сохранённых контролей. Результаты обучения пока не внесены.
+## HAN head, width and residual-history ablations
+
+Branch `experiment/context-price-han-head-ablation` starts from
+`experiment/context-price-han-temporal`. Five values of `--text_temporal_pool`
+define the experiment. All five are trained from scratch on AAPL ABBV ABT ACN
+ADBE ADI AMAT AMD AMGN AMZN with seeds 7,17,27.
+
+| Configuration | Text rows | BiGRU state | Independent group head |
+| --- | --- | --- | --- |
+| `last_matched` (A) | t | Original 384D embedding | Linear(384,3) |
+| `han_h32_linear` (B) | t-19..t | 32 per direction, concatenated 64D | Linear(64,3) |
+| `han_h16_linear` (C) | t-19..t | 16 per direction, concatenated 32D | Linear(32,3) |
+| `han_h32_mlp` (D) | t-19..t | 32 per direction, concatenated 64D | Linear(64,16), GELU, Linear(16,3) |
+| `last_han_h32_residual` (E) | Current t plus history t-19..t-1 | Original current embedding plus 64D historical state | Original Linear(384,3) plus zero-initialized Linear(64,3) |
+
+B/C/D feed HAN's weighted contextual states directly to their heads. The shared
+input projection remains 384 to 32. Scalar sigmoid scores, original-position
+theta, masked softmax and the handling of missing rows reuse the preceding HAN
+implementation. The 64-to-384 bridge is omitted in these new heads. D has GELU
+and no added dropout. Mode-specific `head_structure` records the actual layers;
+the inherited CLI `text_num_layers=1` remains the existing runner protocol.
+
+E is our residual-history ablation on top of Hu's temporal mechanism. It keeps
+the current-summary branch and computes history on the first 19 positions of
+the same 20-row slice. Position 19 (t) is masked out before both recurrent
+directions and attention. Previous positions retain their original indices
+0..18. The current and historical branches have separate presence masks:
+
+```text
+delta_g(A) = current_present_g * current_head_g(e_t)
+delta_g(B/C/D) = window_present_g * head_g(sum_i beta_gi * h_gi)
+delta_g(E) = current_present_g * current_head_g(e_t)
+             + history_present_g * history_head_g(sum_{i=0..18} beta_gi * h_gi)
+prediction = 0.9*FiLM + 0.1*last_price + 0.1*sum_g price_weight_g*delta_g
+```
+
+Both weight and bias of E's history head start at zero. Its effective multiplier
+is one, with the existing alpha=.1 and price weights. The head can receive a
+gradient immediately; encoder gradients become available as its weights update.
+When today's text is absent, available history can still contribute. An empty
+history masks the entire historical head, including its bias.
+
+The common FiLM and price-gate parameters start identically at each seed. A/E
+also share the current-head initialization. B/D use identical initialized input
+projection, BiGRUs and attention; those modules are constructed before each
+condition's different heads. All historical configurations share the input
+projection's initial parameters. Audit hashes and actual batch-order histories
+check these invariants on every ticker/seed pair. A/E additionally save the
+initial validation-window forecast hash; E's forecast is checked exactly against
+the last formula before the optimizer is created. The train-only scaler, splits,
+FiLM input length 64, gate lags [1,5], fixed alpha=.1, blend, Adam lr=.001,
+batch32, label16, pred3, max50 epochs and patience10 follow the HAN queue.
+
+### Contributions and comparisons
+
+For B/C and other linear branches, date contributions include the head bias:
+
+```text
+C_gih = 0.1 * price_weight_g * beta_gi * (W_gh @ h_gi + b_gh)
+```
+
+Their sum reconstructs the group contribution. A has a single current-date
+contribution. E records the current-summary contribution and each historical
+date's contribution separately, plus their total. Its t row has zero historical
+attention and may carry the separately labelled current-summary contribution.
+Validation tables verify reconstruction of every horizon/OHLC output including
+FiLM, anchor and text. For D, tables record group contributions and attention
+weights, with `attention_weights_only` as the diagnostic kind. D's CSV has no
+additive `date_contribution_h*` fields. All diagnostics restore the best checkpoint.
+
+`analyze_context_price_han_head_ablation.py` makes the primary paired comparisons
+C vs B (width), D vs B (head nonlinearity) and E vs A (residual history). It checks
+saved settings, source data, windows/targets/dates, scaler, initial common
+parameters and actual batch orders on common epochs. Reports contain per-run,
+per-ticker and per-seed validation MSE/test MSE/MAE, mean/sample std across seed
+means, paired differences, percentage improvements and wins after averaging seeds.
+Selection is among the five new configurations using validation MSE exclusively.
+
+The previous bridge model from `context_price_han_temporal_10_v1` is an additional
+reference. Its initial architecture is reconstructed on CPU from its saved seed
+and configuration, with the recorded initial hashes verified before comparing
+the encoder substate. Trained weights are not loaded for that reconstruction.
+Inadequate historical proof is reported as partial and disables strict bridge
+comparisons. Reports are written to `diagnostics/comparison` in a fresh directory.
+
+### Resumable 5 + 150 queue
+
+`run_context_price_han_head_ablation_150.sh` invokes a single Python dispatcher,
+`run_han_head_ablation_queue.py`, after setting CODE/PYTHONPATH and OMP/MKL threads=2.
+It runs five separate NVDA seed7 one-epoch smoke checks, then 150 main jobs. CUDA,
+required data and code SHA are checked first. Logs use START/OK/SKIP and N/150.
+After the first completed main job, the log prints mean wall time by mode and ETA.
+Modes without observations initially use the overall mean and are explicitly
+listed as fallbacks. The queue runs until completion or a failure.
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_han_head_ablation_10_v1/
+  queue.log
+  checks/{configuration}/NVDA/seed7/{train.log,completed.json,output/}
+  full/{configuration}/{ticker}/seed{seed}/{train.log,completed.json,output/}
+```
+
+Before any training, existing run directories are validated. Skipping requires
+matching settings, stage epoch limit, seed, data file hash, code SHA, architecture,
+args/checkpoint consistency, best-epoch metrics, actual batch-order evidence and
+all required nonempty artifacts. `completed.json` records artifact hashes and
+wall time and is published atomically. If a completed run lacks this marker,
+the dispatcher validates it and recovers the marker from its artifacts.
+An existing partial or mismatched run stops the queue with its path and reason.
+Inspect it and explicitly move it into an archive outside `checks/` and `full/`
+before retrying. Training artifacts and train.log are preserved. A child training
+failure prints its final log lines. Repeating the launch command resumes by
+skipping the confirmed jobs. SHA, dispatcher/script copies and ticker list are
+also retained under the results root.
+
+### astra
+
+After committing and publishing this branch, run from the host Git checkout.
+The existing `/workspace/variants` mount supplies the detached worktree.
+
+```bash
+set -euo pipefail
+git fetch origin
+VARIANTS_HOST=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace/variants"}}{{.Source}}{{end}}{{end}}' kondyurin-fintexts-compare)
+test -n "$VARIANTS_HOST"
+WORKTREE="$VARIANTS_HOST/context-price-han-head-ablation"
+git worktree add --detach "$WORKTREE" origin/experiment/context-price-han-head-ablation
+CODE_COMMIT=$(git -C "$WORKTREE" rev-parse HEAD)
+CONTAINER_CODE=/workspace/variants/context-price-han-head-ablation
+
+docker exec kondyurin-fintexts-compare python -c \
+  'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'
+
+docker exec -d -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
+  kondyurin-fintexts-compare bash -lc '
+    set -euo pipefail
+    mkdir -p /auto/datasets/kondyurin/FinTexTS/runs/context_price_han_head_ablation_10_v1
+    exec bash run_context_price_han_head_ablation_150.sh >> /auto/datasets/kondyurin/FinTexTS/runs/context_price_han_head_ablation_10_v1/queue.log 2>&1
+  '
+
+docker exec kondyurin-fintexts-compare tail -n 60 -f \
+  /auto/datasets/kondyurin/FinTexTS/runs/context_price_han_head_ablation_10_v1/queue.log
+```
+
+After the queue completes:
+
+```bash
+docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
+  python analyze_context_price_han_head_ablation.py
+```

@@ -11,7 +11,8 @@ from forecasting_task.models.GroupGRUAttention import WINDOW
 
 
 def temporal_records(dataset, indices, film_output, last_price, output, detail, alpha, mode="group_gru_attention"):
-    torch.testing.assert_close(detail["date_contributions"].sum(dim=1), detail["contributions"], rtol=1e-5, atol=1e-6)
+    if "date_contributions" in detail:
+        torch.testing.assert_close(detail["date_contributions"].sum(dim=1), detail["contributions"], rtol=1e-5, atol=1e-6)
     film_part = (1 - alpha) * film_output
     anchor_part = alpha * last_price[:, None].expand_as(output)
     text_part = detail["contributions"].sum(dim=1)[..., None].expand_as(output)
@@ -20,10 +21,11 @@ def temporal_records(dataset, indices, film_output, last_price, output, detail, 
     arrays = {key: value.detach().cpu().numpy() for key, value in detail.items()}
     parts = [value.detach().cpu().numpy() for value in (film_part, anchor_part, text_part, output, reconstructed)]
     groups, dates, components = {}, [], []
+    window = arrays["temporal_beta"].shape[1]
     for sample, index in enumerate(indices):
         stop = index + dataset.seq_len
-        row_dates = [str(value) for value in dataset.row_dates[stop - WINDOW:stop]]
-        if len(row_dates) != WINDOW or row_dates[-1] != dataset.window_end_date(index):
+        row_dates = [str(value) for value in dataset.row_dates[stop - window:stop]]
+        if len(row_dates) != window or row_dates[-1] != dataset.window_end_date(index):
             raise ValueError("GRU diagnostic dates do not match the causal input window")
         for group_index, group in enumerate(TEXT_GROUPS):
             mask = arrays["temporal_present"][sample, :, group_index]
@@ -35,6 +37,13 @@ def temporal_records(dataset, indices, film_output, last_price, output, detail, 
                                     "text_window_present": json.dumps(mask.astype(int).tolist()),
                                     "text_window_beta": json.dumps(beta.tolist()),
                                     "available_dates": int(mask.sum())}
+            if mode in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"):
+                groups[index, group]["date_decomposition"] = "date_contributions" in arrays
+            if "current_contributions" in arrays:
+                groups[index, group]["current_present"] = int(arrays["current_present"][sample, group_index])
+                for horizon in range(output.shape[1]):
+                    groups[index, group][f"current_contribution_h{horizon + 1}"] = float(arrays["current_contributions"][sample, group_index, horizon])
+                    groups[index, group][f"history_contribution_h{horizon + 1}"] = float(arrays["history_contributions"][sample, group_index, horizon])
             for row, date in enumerate(row_dates):
                 record = {"window_index": index, "input_end_date": row_dates[-1], "group": group,
                           "date": date, "age": float(arrays["temporal_ages"][row])}
@@ -44,8 +53,17 @@ def temporal_records(dataset, indices, film_output, last_price, output, detail, 
                               group_weight=float(arrays["weights"][sample, group_index]))
                 if "temporal_gaps" not in arrays:
                     record["representation"] = "contextual_BiGRU_state_projected_64_to_384"
+                    if mode in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"):
+                        record["representation"] = "current_summary" if mode == "last_matched" else "contextual_BiGRU_state"
+                        record["decomposition_kind"] = "linear_date_contributions" if "date_contributions" in arrays else "attention_weights_only"
+                if "temporal_source_present" in arrays:
+                    record["source_present"] = int(arrays["temporal_source_present"][sample, row, group_index])
                 for horizon in range(output.shape[1]):
-                    record[f"date_contribution_h{horizon + 1}"] = float(arrays["date_contributions"][sample, row, group_index, horizon])
+                    if "date_contributions" in arrays:
+                        record[f"date_contribution_h{horizon + 1}"] = float(arrays["date_contributions"][sample, row, group_index, horizon])
+                    if "current_contributions" in arrays:
+                        record[f"current_contribution_h{horizon + 1}"] = float(arrays["current_contributions"][sample, group_index, horizon]) if row == window - 1 else 0.
+                        record[f"history_date_contribution_h{horizon + 1}"] = float(arrays["history_date_contributions"][sample, row, group_index, horizon])
                     record[f"group_contribution_h{horizon + 1}"] = float(arrays["contributions"][sample, group_index, horizon])
                 dates.append(record)
         for horizon in range(output.shape[1]):
@@ -53,6 +71,9 @@ def temporal_records(dataset, indices, film_output, last_price, output, detail, 
                 record = {"window_index": index, "input_end_date": row_dates[-1], "horizon": horizon + 1, "channel": name}
                 for key, values in zip(("film_part", "anchor_part", "text_part", "prediction", "reconstructed"), parts):
                     record[key] = float(values[sample, horizon, channel])
+                if "current_contributions" in arrays:
+                    record["current_text_part"] = float(arrays["current_contributions"][sample, :, horizon].sum())
+                    record["history_text_part"] = float(arrays["history_contributions"][sample, :, horizon].sum())
                 components.append(record)
     return groups, dates, components
 

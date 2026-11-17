@@ -73,7 +73,8 @@ def parse_args(argv=None):
     parser.add_argument("--group_gate", choices=["static", "context_novelty", "context_no_novelty", "context_price_only"], default=None,
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
     parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
-    parser.add_argument("--text_temporal_pool", choices=["last", "group_gru_attention", "group_han_temporal", "group_han_uniform"], default="last")
+    parser.add_argument("--text_temporal_pool", choices=["last", "group_gru_attention", "group_han_temporal", "group_han_uniform",
+                        "last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"], default="last")
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
         help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
@@ -106,8 +107,10 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
-    if args.text_temporal_pool != "last" and (args.group_gate != "context_price_only" or args.seq_len < 20):
+    if args.text_temporal_pool not in ("last", "last_matched") and (args.group_gate != "context_price_only" or args.seq_len < 20):
         parser.error("temporal text modes require context_price_only and seq_len>=20")
+    if args.text_temporal_pool == "last_matched" and args.group_gate != "context_price_only":
+        parser.error("last_matched requires context_price_only")
     if args.group_weight_mode is None:
         args.group_weight_mode = "fixed_uniform" if args.group_gate else "learnable"
     if args.group_gate:
@@ -164,12 +167,14 @@ def parse_args(argv=None):
         args.text_model_config["group_gate"] = args.group_gate
         if args.group_gate == "context_price_only":
             from forecasting_task.models.GroupGRUAttention import temporal_structure
-            args.temporal_pool_structure = temporal_structure(args.text_temporal_pool)
+            args.temporal_pool_structure = temporal_structure(args.text_temporal_pool, args.pred_len)
             args.text_model_config.update(text_temporal_pool=args.text_temporal_pool,
                                           temporal_pool_structure=args.temporal_pool_structure)
         if args.group_gate != "static":
             args.group_weight_mode = args.group_gate
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
+    if args.group_gate == "context_price_only" and "head_structure" in args.temporal_pool_structure:
+        args.text_mlp_structure = args.temporal_pool_structure["head_structure"]
     args.enc_in = 4
     args.dec_in = 4
     args.c_out = 4
@@ -386,6 +391,13 @@ def main(argv=None):
         args.common_initialization = common_initialization(model, text_model)
         args.temporal_initialization_sha256 = state_fingerprint(text_model.temporal_pool) if hasattr(text_model, "temporal_pool") else None
         args.source_data_evidence = source_data_evidence({"train": train_dataset, "val": val_dataset, "test": test_dataset})
+        from forecasting_task.models.HANHeadAblation import ABLATION_MODES, initial_prediction_evidence
+        if args.text_temporal_pool in ABLATION_MODES:
+            args.head_ablation_initialization = {
+                "encoder_input_projection_sha256": state_fingerprint(text_model.temporal_pool.projection) if hasattr(text_model, "temporal_pool") else None,
+                "encoder_sha256": args.temporal_initialization_sha256}
+            args.initial_prediction_evidence = (initial_prediction_evidence(model, text_model, val_dataset, args, device, _prepare_batch)
+                                                if args.text_temporal_pool in ("last_matched", "last_han_h32_residual") else None)
     args.initial_text_alpha = text_model.get_alpha().detach().cpu().item()
     if args.group_weight_mode == "learnable":
         # Capture the effective softmax values before the optimizer can update G.
@@ -536,6 +548,9 @@ def main(argv=None):
                                       temporal_initialization_sha256=args.temporal_initialization_sha256,
                                       source_data_evidence=args.source_data_evidence,
                                       train_batch_orders=[r["train_batch_order"] for r in history])
+                    if hasattr(args, "head_ablation_initialization"):
+                        checkpoint.update(head_ablation_initialization=args.head_ablation_initialization,
+                                          initial_prediction_evidence=args.initial_prediction_evidence)
 
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
@@ -660,6 +675,9 @@ def main(argv=None):
         summary.update(common_initialization=args.common_initialization, source_data_evidence=args.source_data_evidence,
                        temporal_initialization_sha256=args.temporal_initialization_sha256,
                        train_batch_orders=[r["train_batch_order"] for r in history])
+        if hasattr(args, "head_ablation_initialization"):
+            summary.update(head_ablation_initialization=args.head_ablation_initialization,
+                           initial_prediction_evidence=args.initial_prediction_evidence)
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len
         summary["actual_stride"] = model.patch_embedding.stride

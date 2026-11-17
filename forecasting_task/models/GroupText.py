@@ -226,7 +226,7 @@ class ContextNoveltyTextModel(nn.Module):
         return state
 
     def forward(self, price_output, last_price, embeddings, *, price_window, novelty,
-                pair_available, return_details=False, group_present=None):
+                pair_available, return_details=False, group_present=None, group_outputs=None):
         batch = embeddings.shape[0]
         if embeddings.ndim != 3 or embeddings.shape[1:] != (5, 384):
             raise ValueError("Expected last-day embeddings [batch, 5, 384]")
@@ -248,8 +248,11 @@ class ContextNoveltyTextModel(nn.Module):
         present = embeddings.abs().sum(dim=-1) >= 1e-6 if group_present is None else group_present
         if present.shape != (batch, 5) or present.dtype != torch.bool:
             raise ValueError("Expected boolean group presence [batch,5]")
-        heads = torch.stack([self.group_mlps[group](embeddings[:, index])
-                             for index, group in enumerate(TEXT_GROUPS)], dim=1)
+        heads = (torch.stack([self.group_mlps[group](embeddings[:, index])
+                              for index, group in enumerate(TEXT_GROUPS)], dim=1)
+                 if group_outputs is None else group_outputs)
+        if heads.shape != (batch, 5, self.pred_len):
+            raise ValueError("Expected group head outputs [batch,5,pred_len]")
         masked = heads * present.unsqueeze(-1).to(heads.dtype)
         weighted = weights.unsqueeze(-1) * masked
         delta = weighted.sum(dim=1).unsqueeze(-1).expand_as(price_output)
@@ -265,6 +268,11 @@ class ContextNoveltyTextModel(nn.Module):
 def build_text_model(config, group_weight_mode="learnable"):
     config = dict(config)
     temporal_pool = config.pop("text_temporal_pool", "last")
+    if temporal_pool in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"):
+        if group_weight_mode != "context_price_only":
+            raise ValueError("HAN head ablations require context_price_only")
+        from forecasting_task.models.HANHeadAblation import HANHeadAblationTextModel
+        return HANHeadAblationTextModel(text_temporal_pool=temporal_pool, **config)
     if temporal_pool in ("group_han_temporal", "group_han_uniform"):
         if group_weight_mode != "context_price_only":
             raise ValueError("HAN temporal modes require context_price_only")

@@ -28,10 +28,10 @@ def han_structure(mode):
 
 
 class HANDateAttention(nn.Module):
-    def __init__(self):
+    def __init__(self, state_size=64):
         super().__init__()
         # Scalar o_i makes the paper's theta_i * o_i a scalar logit.
-        self.transform = nn.Linear(64, 1)
+        self.transform = nn.Linear(state_size, 1)
         self.position = nn.Parameter(torch.ones(WINDOW))
 
     def forward(self, states, present):
@@ -43,7 +43,7 @@ class HANDateAttention(nn.Module):
 
 def masked_bigru(gru, values, present):
     """Drop missing rows for recurrence, then restore their original positions."""
-    states = values.new_zeros((*present.shape, 64))
+    states = values.new_zeros((*present.shape, 2 * gru.hidden_size))
     nonempty = present.any(1).nonzero(as_tuple=False).flatten().tolist()
     if nonempty:
         sequences = [values[index, present[index]] for index in nonempty]
@@ -56,21 +56,26 @@ def masked_bigru(gru, values, present):
 
 
 class GroupHANPool(nn.Module):
-    def __init__(self, mode):
+    def __init__(self, mode, hidden_size=32, output_projection=True):
         super().__init__()
         self.mode = mode
+        self.output_projection = output_projection
         self.projection = nn.Linear(384, 32)
-        self.grus = nn.ModuleDict({g: nn.GRU(32, 32, batch_first=True, bidirectional=True) for g in TEXT_GROUPS})
-        self.attentions = nn.ModuleDict({g: HANDateAttention() for g in TEXT_GROUPS})
-        self.output_projections = nn.ModuleDict({g: nn.Linear(64, 384) for g in TEXT_GROUPS})
+        self.grus = nn.ModuleDict({g: nn.GRU(32, hidden_size, batch_first=True, bidirectional=True) for g in TEXT_GROUPS})
+        self.attentions = nn.ModuleDict({g: HANDateAttention(2 * hidden_size) for g in TEXT_GROUPS})
+        self.output_projections = nn.ModuleDict({g: nn.Linear(2 * hidden_size, 384) for g in TEXT_GROUPS}) if output_projection else nn.ModuleDict()
 
-    def forward(self, text_window):
+    def forward(self, text_window, exclude_current=False):
         if text_window.ndim != 4 or text_window.shape[1] < WINDOW or text_window.shape[2:] != (5, 384):
             raise ValueError("Expected text window [batch,time>=20,5,384]")
         original = text_window[:, -WINDOW:].float()
         if not torch.isfinite(original).all():
             raise ValueError("Text history must be finite")
         present = original.abs().sum(-1) >= 1e-6
+        source_present = present
+        if exclude_current:
+            present = present.clone()
+            present[:, -1] = False
         projected = self.projection(original)
         betas, states_by_group, values_by_group, pooled = [], [], [], []
         for index, group in enumerate(TEXT_GROUPS):
@@ -81,18 +86,21 @@ class GroupHANPool(nn.Module):
             else:
                 beta = self.attentions[group](states, mask)
             latent = (beta[..., None] * states).sum(1)
-            group_value = self.output_projections[group](latent) * mask.any(1)[:, None]
+            group_value = self.output_projections[group](latent) * mask.any(1)[:, None] if self.output_projection else latent
             pooled.append(group_value)
             # Distribute the output-projection bias over dates through sum(beta)=1.
-            values_by_group.append(self.output_projections[group](states))
+            values_by_group.append(self.output_projections[group](states) if self.output_projection else states)
             betas.append(beta)
             states_by_group.append(states)
         pooled = torch.stack(pooled, 1)
-        return pooled, present.any(1), {
+        details = {
             "temporal_beta": torch.stack(betas, 2), "temporal_present": present,
             "temporal_states": torch.stack(states_by_group, 2), "date_values": torch.stack(values_by_group, 2),
             "temporal_ages": torch.arange(19, -1, -1, device=original.device, dtype=original.dtype) / 19,
             "pooled_embeddings": pooled}
+        if exclude_current:
+            details["temporal_source_present"] = source_present
+        return pooled, present.any(1), details
 
 
 class GroupHANTemporalTextModel(ContextNoveltyTextModel):
