@@ -31,6 +31,13 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
             output, detail = text_model(film_output, x[:, -1], text[:, -1],
                                         price_window=x, return_details=True, **metadata)
             group_records = {}
+            if "huang_beta" in detail:
+                from forecasting_task.huang_diagnostics import huang_records
+                group_records, date_records, component_records = huang_records(
+                    dataset, batch[5].tolist(), film_output, x[:, -1], output, detail, text_model.get_alpha(),
+                    mode=args.text_temporal_pool)
+                temporal_dates.extend(date_records)
+                temporal_components.extend(component_records)
             if "temporal_beta" in detail:
                 from forecasting_task.gru_diagnostics import temporal_records
                 group_records, date_records, component_records = temporal_records(

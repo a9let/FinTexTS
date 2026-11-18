@@ -17,7 +17,9 @@ import torch
 import yaml
 
 from forecasting_task.models.GroupText import TEXT_GROUPS, build_text_model
-from forecasting_task.models.HANHeadAblation import ABLATION_MODES, head_ablation_structure
+from forecasting_task.models.HANHeadAblation import ABLATION_MODES
+from forecasting_task.models.GroupHuangQuery import HUANG_MODES
+from forecasting_task.models.GroupGRUAttention import temporal_structure
 from forecasting_task.window_evidence import SPLIT_POLICY
 
 
@@ -40,16 +42,16 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def jobs():
-    checks = [('checks', mode, 'NVDA', 7, 1) for mode in ABLATION_MODES]
-    full = [('full', mode, ticker, seed, 50) for mode in ABLATION_MODES for ticker in TICKERS for seed in SEEDS]
+def jobs(modes=ABLATION_MODES):
+    checks = [('checks', mode, 'NVDA', 7, 1) for mode in modes]
+    full = [('full', mode, ticker, seed, 50) for mode in modes for ticker in TICKERS for seed in SEEDS]
     return checks + full
 
 
 def expected_config(mode, ticker, seed, epochs, commit, data):
     return {**SETTINGS, 'text_temporal_pool': mode, 'ticker': ticker, 'seed': seed, 'num_epoch': epochs,
             'code_commit': commit, 'root_path': str(Path(data).resolve()),
-            'used_col_prefixes': list(TEXT_GROUPS), 'structure': head_ablation_structure(mode, SETTINGS['pred_len'])}
+            'used_col_prefixes': list(TEXT_GROUPS), 'structure': temporal_structure(mode, SETTINGS['pred_len'])}
 
 
 def validate_completed(destination, expected):
@@ -77,7 +79,8 @@ def validate_completed(destination, expected):
     for key in ('code_commit', 'text_temporal_pool', 'seed'):
         if summary.get(key) != expected[key]:
             raise ValueError(f'{destination}: summary {key} differs')
-    for key in ('window_evidence', 'source_data_evidence', 'common_initialization', 'head_ablation_initialization',
+    initialization_key = 'huang_initialization' if expected['text_temporal_pool'] in HUANG_MODES else 'head_ablation_initialization'
+    for key in ('window_evidence', 'source_data_evidence', 'common_initialization', initialization_key,
                 'initial_prediction_evidence', 'temporal_initialization_sha256', 'split_policy', 'temporal_pool_structure'):
         if key not in args or key not in summary or key not in checkpoint or args[key] != summary[key] or args[key] != checkpoint[key]:
             raise ValueError(f'{destination}: inconsistent saved {key}')
@@ -110,10 +113,10 @@ def validate_completed(destination, expected):
     with torch.random.fork_rng(devices=[]):
         text = build_text_model(args['text_model_config'], args['group_weight_mode'])
         text.load_state_dict(checkpoint['text_model_state_dict'], strict=True)
-    if expected['text_temporal_pool'] in ('last_matched', 'last_han_h32_residual'):
+    if expected['text_temporal_pool'] in ('last_matched', 'last_han_h32_residual', *HUANG_MODES):
         proof = args['initial_prediction_evidence']
         if not proof or proof.get('matches_last_matched_formula') is not True or proof.get('max_abs_difference') != 0:
-            raise ValueError(f'{destination}: initial A/E equality unconfirmed')
+            raise ValueError(f'{destination}: initial last-formula equality unconfirmed')
     return summary
 
 
@@ -172,7 +175,7 @@ def execute_training(command, log_path, code):
         return subprocess.run(command, cwd=code, stdout=handle, stderr=subprocess.STDOUT).returncode
 
 
-def print_timing(markers):
+def print_timing(markers, modes=ABLATION_MODES):
     times = defaultdict(list)
     for job, marker in markers.items():
         if job[0] == 'full':
@@ -182,18 +185,19 @@ def print_timing(markers):
         return
     overall = sum(observed) / len(observed)
     remaining, fallback = 0., []
-    for mode in ABLATION_MODES:
+    for mode in modes:
         values = times[mode]
         mean = sum(values) / len(values) if values else overall
         if not values:
             fallback.append(mode)
         remaining += (30 - len(values)) * mean
         print(f'TIMING mode={mode} completed={len(values)}/30 mean_seconds={sum(values)/len(values) if values else "pending"}', flush=True)
-    print(f'ETA remaining_runs={150-len(observed)} estimated_seconds={remaining:.1f} estimated_hours={remaining/3600:.2f} '
+    print(f'ETA remaining_runs={30*len(modes)-len(observed)} estimated_seconds={remaining:.1f} estimated_hours={remaining/3600:.2f} '
           f'overall_mean_fallback_modes={",".join(fallback)}', flush=True)
 
 
-def run_queue(code, data=DATA, results=RESULTS, commit=None):
+def run_queue(code, data=DATA, results=RESULTS, commit=None, *, modes=ABLATION_MODES, scripts=None):
+    total = len(modes) * len(TICKERS) * len(SEEDS)
     code, data, results = Path(code), Path(data).resolve(), Path(results)
     for ticker in (*TICKERS, 'NVDA'):
         if not (data / (ticker + '.parquet')).is_file():
@@ -212,25 +216,25 @@ def run_queue(code, data=DATA, results=RESULTS, commit=None):
     results.mkdir(parents=True, exist_ok=True)
     record_file(results / 'code_commit.txt', (commit + '\n').encode())
     record_file(results / 'selected_tickers.txt', ('\n'.join(TICKERS) + '\n').encode())
-    for name in ('run_context_price_han_head_ablation_150.sh', Path(__file__).name):
+    for name in (scripts or ('run_context_price_han_head_ablation_150.sh', Path(__file__).name)):
         record_file(results / name, (code / name).read_bytes())
-    planned, markers = jobs(), {}
+    planned, markers = jobs(modes), {}
     for job in planned:
         stage, mode, ticker, seed, epochs = job
         destination = results / stage / mode / ticker / f'seed{seed}'
         if destination.exists():
             markers[job] = completion(destination, expected_config(mode, ticker, seed, epochs, commit, data))
     completed = sum(job[0] == 'full' for job in markers)
-    print_timing(markers)
+    print_timing(markers, modes)
     for job in planned:
         stage, mode, ticker, seed, epochs = job
         destination = results / stage / mode / ticker / f'seed{seed}'
         if job in markers:
-            print(f'SKIP stage={stage} mode={mode} ticker={ticker} seed={seed} completed={completed}/150', flush=True)
+            print(f'SKIP stage={stage} mode={mode} ticker={ticker} seed={seed} completed={completed}/{total}', flush=True)
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.mkdir()
-        print(f'START stage={stage} mode={mode} ticker={ticker} seed={seed} completed={completed}/150', flush=True)
+        print(f'START stage={stage} mode={mode} ticker={ticker} seed={seed} completed={completed}/{total}', flush=True)
         started = time.monotonic()
         status = execute_training(training_command(mode, ticker, seed, epochs, commit, data, destination / 'output'), destination / 'train.log', code)
         if status:
@@ -240,22 +244,22 @@ def run_queue(code, data=DATA, results=RESULTS, commit=None):
         markers[job] = completion(destination, expected_config(mode, ticker, seed, epochs, commit, data), time.monotonic() - started)
         if stage == 'full':
             completed += 1
-        print(f'OK stage={stage} mode={mode} ticker={ticker} seed={seed} completed={completed}/150', flush=True)
-        print_timing(markers)
-    if completed != 150:
-        raise ValueError(f'Unexpected completed count: {completed}/150')
-    print('ALL 150 RUNS COMPLETED', flush=True)
+        print(f'OK stage={stage} mode={mode} ticker={ticker} seed={seed} completed={completed}/{total}', flush=True)
+        print_timing(markers, modes)
+    if completed != total:
+        raise ValueError(f'Unexpected completed count: {completed}/{total}')
+    print(f'ALL {total} RUNS COMPLETED', flush=True)
     return markers
 
 
-def cli():
+def cli(*, results=RESULTS, modes=ABLATION_MODES, scripts=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--code', type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument('--data', type=Path, default=DATA)
-    parser.add_argument('--results', type=Path, default=RESULTS)
+    parser.add_argument('--results', type=Path, default=results)
     args = parser.parse_args()
     try:
-        run_queue(args.code, args.data, args.results)
+        run_queue(args.code, args.data, args.results, modes=modes, scripts=scripts)
     except subprocess.CalledProcessError as error:
         print(f'FAILED exit={error.returncode}: {error.cmd}; incomplete files preserved', file=sys.stderr)
         raise SystemExit(error.returncode)

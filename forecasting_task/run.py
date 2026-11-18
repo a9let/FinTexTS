@@ -74,7 +74,8 @@ def parse_args(argv=None):
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
     parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
     parser.add_argument("--text_temporal_pool", choices=["last", "group_gru_attention", "group_han_temporal", "group_han_uniform",
-                        "last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"], default="last")
+                        "last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual",
+                        "huang_recurrent_query", "huang_constant_query"], default="last")
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
         help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
@@ -107,6 +108,8 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.text_temporal_pool in ("huang_recurrent_query", "huang_constant_query") and args.seq_len < 30:
+        parser.error("Grouped Huang query modes require seq_len>=30")
     if args.text_temporal_pool not in ("last", "last_matched") and (args.group_gate != "context_price_only" or args.seq_len < 20):
         parser.error("temporal text modes require context_price_only and seq_len>=20")
     if args.text_temporal_pool == "last_matched" and args.group_gate != "context_price_only":
@@ -392,6 +395,11 @@ def main(argv=None):
         args.temporal_initialization_sha256 = state_fingerprint(text_model.temporal_pool) if hasattr(text_model, "temporal_pool") else None
         args.source_data_evidence = source_data_evidence({"train": train_dataset, "val": val_dataset, "test": test_dataset})
         from forecasting_task.models.HANHeadAblation import ABLATION_MODES, initial_prediction_evidence
+        from forecasting_task.models.GroupHuangQuery import HUANG_MODES
+        if args.text_temporal_pool in HUANG_MODES:
+            args.huang_initialization = {g: state_fingerprint(module, exclude_prefixes=("query",))
+                                         for g, module in text_model.temporal_pool.groups.items()}
+            args.initial_prediction_evidence = initial_prediction_evidence(model, text_model, val_dataset, args, device, _prepare_batch)
         if args.text_temporal_pool in ABLATION_MODES:
             args.head_ablation_initialization = {
                 "encoder_input_projection_sha256": state_fingerprint(text_model.temporal_pool.projection) if hasattr(text_model, "temporal_pool") else None,
@@ -551,6 +559,9 @@ def main(argv=None):
                     if hasattr(args, "head_ablation_initialization"):
                         checkpoint.update(head_ablation_initialization=args.head_ablation_initialization,
                                           initial_prediction_evidence=args.initial_prediction_evidence)
+                    if hasattr(args, "huang_initialization"):
+                        checkpoint.update(huang_initialization=args.huang_initialization,
+                                          initial_prediction_evidence=args.initial_prediction_evidence)
 
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
@@ -677,6 +688,9 @@ def main(argv=None):
                        train_batch_orders=[r["train_batch_order"] for r in history])
         if hasattr(args, "head_ablation_initialization"):
             summary.update(head_ablation_initialization=args.head_ablation_initialization,
+                           initial_prediction_evidence=args.initial_prediction_evidence)
+        if hasattr(args, "huang_initialization"):
+            summary.update(huang_initialization=args.huang_initialization,
                            initial_prediction_evidence=args.initial_prediction_evidence)
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len

@@ -1158,3 +1158,138 @@ After the queue completes:
 docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
   python analyze_context_price_han_head_ablation.py
 ```
+
+## Групповой рекуррентный запрос Huang
+
+Ветка `experiment/context-price-huang-query` основана непосредственно на
+`experiment/context-price-han-head-ablation`, независимо от эксперимента с окнами HAN.
+Режимы `huang_recurrent_query` и `huang_constant_query` — групповая адаптация
+рекуррентного ядра [Huang et al. (2022), разделы 3.1–3.2](https://doi.org/10.1016/j.neucom.2021.10.092)
+([авторская копия](https://frcchang.github.io/pub/News-driven%20stock%20prediction%20via%20noisy%20equity%20state%20representation.pdf)).
+Переносится цикл «состояние → внимание → обновление состояния».
+Отличия от статьи: пять независимых состояний вместо одного, дневные
+MiniLM-сводки вместо отдельных заголовков и поправка к прогнозу OHLC.
+Текущая сводка здесь равна u без дополнительного tanh после проекции.
+Шумовая ветка, будущие публикации и классификатор направления отсутствуют.
+Запрос не строится из OHLC; цена участвует только в прежних FiLM и price gate.
+
+У macro, sector, targetCompany, relatedCompany и filing полностью отдельные
+U/V, запрос, LSTMCell, скрытое состояние, память и выходная голова.
+Для каждой группы:
+
+```text
+present_i = float32_L1(e_i) >= 1e-6
+u_i = sigmoid(U_g e_i) * tanh(V_g e_i)          # 384→32, U/V без bias
+q_s = tanh(W_q,g z_{s-1})                     # recurrent, W_q без bias
+q_s = learned_q_g                            # constant, начальный вектор 0
+beta_s = masked_softmax(q_s @ u_{s-10:s} / sqrt(32))
+b_s = tanh(sum_i beta_si * u_i)
+c_s = u_s if present_s else 0
+(z_s, m_s) = LSTMCell_g([c_s; b_s], (z_{s-1}, m_{s-1}))
+```
+
+Вход — те же готовые групповые MiniLM-эмбеддинги. Состояния обнуляются
+в каждом окне, затем выполняются 20 шагов t−19,…,t с hidden_size=32.
+История шага s содержит только s−10,…,s−1 из того же входного окна FiLM.
+Поэтому читается суффикс t−29,…,t; строки раньше него не используются.
+Это строки датасета, без заполнения пропусков или доступа к будущим строкам.
+При пустой истории beta и b равны нулю. При отсутствии и текущей сводки,
+и истории оба состояния сохраняются, включая память LSTM.
+
+Итоговая голова Linear(32→3) имеет нулевые начальные weight и bias.
+Если группа не обработала текст ни на одном шаге, поправка обнуляется
+целиком. Текущий текст и историческая поправка маскируются независимо:
+
+```text
+current_gh = present_gt * last_head_g(e_gt)
+history_gh = processed_g * correction_head_g(z_gt)
+prediction_h = 0.9*FiLM_h + 0.1*last_price
+             + 0.1*sum_g price_weight_g*(current_gh + history_gh)
+```
+
+Поправка каждого горизонта общая для четырёх каналов OHLC.
+При нулевых головах начальный прогноз точно совпадает с last_matched.
+FiLM, текущие головы, price gate, U/V, LSTM и нулевые головы инициализируются
+одинаково в двух условиях; создание запросов изолировано от RNG общих модулей.
+Запрос recurrent использует предыдущее состояние только своей группы,
+constant — отдельный обучаемый вектор 32 для каждой группы.
+Все параметры обучаются совместно прежним Adam. Сохраняются seq_len=64,
+label_len=16, pred_len=3, batch_size=32, lr=0.001, максимум 50 эпох,
+patience=10, price gate [1,5], фиксированная alpha=0.1, blend, scaler и разбиения.
+Обучение с нуля; веса старого контроля не загружаются для обучения.
+
+В args/summary/checkpoint записываются структура, источник запроса, SHA,
+отпечатки данных/окон/целей/дат, общих начальных параметров и прогноза,
+а также фактический порядок батчей по эпохам. Checkpoint сохраняет все
+параметры пяти ветвей и optimizer. Диагностика лучшего validation checkpoint:
+
+- `validation_group_diagnostics.csv`: подписанные текущий и исторический
+  вклады после price gate и alpha, отдельно для каждой группы и горизонта;
+- `validation_text_dates.csv`: веса десяти прошлых дат на каждом из 20 шагов,
+  исходные даты, маски, возраст строки и факт обновления состояния;
+- `validation_prediction_components.csv`: FiLM, anchor, текущая и историческая
+  поправки, прогноз и его проверенное восстановление; прежние графики сохраняются.
+
+Веса отдельных дат являются вниманием внутри нелинейной LSTM, а не аддитивным
+разложением прогноза. Групповые текущий/исторический вклады восстанавливаются точно.
+
+`run_context_price_huang_query_60.sh` запускает два NVDA seed7 check на одной
+эпохе, затем 60 запусков: два условия × AAPL ABBV ABT ACN ADBE ADI AMAT AMD AMGN
+AMZN × seeds 7,17,27. Старый last_matched не переобучается. Диспетчер проверяет
+CUDA, данные, полный SHA (`CODE_COMMIT` при недоступном Git), сохраняет копии
+скриптов и список тикеров, OMP/MKL=2, START/OK/SKIP, N/60, время по условиям
+и ETA. Подтверждённые завершённые запуски можно пропускать при возобновлении.
+Неполные/несовпадающие каталоги останавливают очередь; ошибки выводят хвост
+train.log. Существующие результаты не перезаписываются.
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_query_10_v1/
+  checks/{mode}/NVDA/seed7/{train.log,completed.json,output/}
+  full/{mode}/{ticker}/seed{seed}/{train.log,completed.json,output/}
+  diagnostics/query_comparison/
+```
+
+`analyze_context_price_huang_query.py` сравнивает recurrent vs constant и оба
+условия с сохранённым `last_matched` из `context_price_han_head_ablation_10_v1`.
+Анализ работает на CPU без обучения или model inference: читает метрики и
+проверяет сохранённые test outputs. Сверяет конфигурацию, scaler, данные,
+окна/цели/даты validation/test, общую инициализацию, начальный прогноз и
+реальный порядок батчей на общих эпохах. `window_verification.csv` явно
+различает full/partial/mismatch/not_checked отдельно для каждой пары.
+При неполном подтверждении last сравнение с ним остаётся partial, парные
+разницы/проценты не объявляются строгими; основная пара проверяется независимо.
+Контроль автоматически не переобучается. Отчёты включают validation MSE,
+test MSE/MAE, каждый ticker/seed, seed-средние, mean/sample std между seeds,
+парные разницы и победы по акциям после усреднения seeds. Выбор источника
+запроса — только по validation MSE. Старый отчёт не перезаписывается;
+для повторного анализа задайте новый `--output_dir`.
+
+После отдельного коммита и публикации ветки, на astra из host Git checkout:
+
+```bash
+set -euo pipefail
+git fetch origin
+VARIANTS_HOST=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace/variants"}}{{.Source}}{{end}}{{end}}' kondyurin-fintexts-compare)
+test -n "$VARIANTS_HOST"
+WORKTREE="$VARIANTS_HOST/context-price-huang-query"
+git worktree add --detach "$WORKTREE" origin/experiment/context-price-huang-query
+CODE_COMMIT=$(git -C "$WORKTREE" rev-parse HEAD)
+CONTAINER_CODE=/workspace/variants/context-price-huang-query
+
+docker exec kondyurin-fintexts-compare python -c \
+  'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'
+
+docker exec -d -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
+  kondyurin-fintexts-compare bash -lc '
+    set -euo pipefail
+    mkdir -p /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_query_10_v1
+    exec bash run_context_price_huang_query_60.sh >> /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_query_10_v1/queue.log 2>&1
+  '
+
+docker exec kondyurin-fintexts-compare tail -n 60 -f \
+  /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_query_10_v1/queue.log
+
+# После завершения очереди:
+docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
+  python analyze_context_price_huang_query.py
+```

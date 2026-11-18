@@ -268,6 +268,11 @@ class ContextNoveltyTextModel(nn.Module):
 def build_text_model(config, group_weight_mode="learnable"):
     config = dict(config)
     temporal_pool = config.pop("text_temporal_pool", "last")
+    if temporal_pool in ("huang_recurrent_query", "huang_constant_query"):
+        if group_weight_mode != "context_price_only":
+            raise ValueError("Grouped Huang query modes require context_price_only")
+        from forecasting_task.models.GroupHuangQuery import GroupHuangQueryTextModel
+        return GroupHuangQueryTextModel(text_temporal_pool=temporal_pool, **config)
     if temporal_pool in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"):
         if group_weight_mode != "context_price_only":
             raise ValueError("HAN head ablations require context_price_only")
