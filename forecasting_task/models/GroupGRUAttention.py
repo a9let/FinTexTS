@@ -10,10 +10,10 @@ WINDOW = 20
 HIDDEN_SIZE = 32
 
 
-def temporal_structure(mode, pred_len=3):
-    if mode in ("huang_recurrent_query", "huang_constant_query"):
+def temporal_structure(mode, pred_len=3, **huang_parameters):
+    if mode in ("huang_recurrent_query", "huang_constant_query", "huang_recurrent_replace"):
         from forecasting_task.models.GroupHuangQuery import huang_structure
-        return huang_structure(mode, pred_len)
+        return huang_structure(mode, pred_len, **huang_parameters)
     if mode in ("last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual"):
         from forecasting_task.models.HANHeadAblation import head_ablation_structure
         return head_ablation_structure(mode, pred_len)

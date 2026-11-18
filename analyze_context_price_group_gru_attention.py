@@ -69,10 +69,18 @@ def configuration_issues(run, summary, args, checkpoint, reference):
         if args.get(key, value) != value:
             mismatch.append(f'unsupported {key}')
     if run.variant != 'original_baseline':
+        parameters = {}
+        if run.variant in ('huang_recurrent_query', 'huang_constant_query', 'huang_recurrent_replace'):
+            from forecasting_task.models.GroupHuangQuery import huang_options
+            parameters = huang_options(args)
+            for source_name, source in (('args', args), ('summary', summary), ('checkpoint', checkpoint),
+                                         ('text_model_config', args.get('text_model_config', {}))):
+                if huang_options(source) != parameters:
+                    mismatch.append(f'{source_name}.huang_parameters mismatch')
         for source_name, source in (('args', args), ('summary', summary), ('checkpoint', checkpoint)):
             for key, value in (('text_temporal_pool', run.variant), ('group_gate', 'context_price_only'),
                                ('fixed_alpha', .1), ('text_weight_mode', 'fixed'), ('split_policy', SPLIT_POLICY),
-                               ('temporal_pool_structure', temporal_structure(run.variant))):
+                               ('temporal_pool_structure', temporal_structure(run.variant, **parameters))):
                 if key not in source:
                     missing.append(f'{source_name}.{key}')
                 elif source[key] != value:
@@ -83,7 +91,7 @@ def configuration_issues(run, summary, args, checkpoint, reference):
         for key, value in (('text_temporal_pool', run.variant), ('group_gate', 'context_price_only'),
                            ('pred_len', args['pred_len']), ('num_layers', 1), ('initial_text_weight', .1),
                            ('fusion_mode', 'blend'), ('used_col_prefixes', list(TEXT_GROUPS)),
-                           ('temporal_pool_structure', temporal_structure(run.variant))):
+                           ('temporal_pool_structure', temporal_structure(run.variant, **parameters))):
             if config.get(key) != value:
                 mismatch.append(f'text_model_config.{key} mismatch')
         for key, value in (('text_num_layers', 1), ('fusion_mode', 'blend'),

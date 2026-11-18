@@ -73,9 +73,12 @@ def parse_args(argv=None):
     parser.add_argument("--group_gate", choices=["static", "context_novelty", "context_no_novelty", "context_price_only"], default=None,
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
     parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
+    parser.add_argument("--huang_hidden_size", type=int, default=32)
+    parser.add_argument("--huang_recurrent_steps", type=int, default=20)
+    parser.add_argument("--huang_attention_lookback", type=int, default=10)
     parser.add_argument("--text_temporal_pool", choices=["last", "group_gru_attention", "group_han_temporal", "group_han_uniform",
                         "last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual",
-                        "huang_recurrent_query", "huang_constant_query"], default="last")
+                        "huang_recurrent_query", "huang_constant_query", "huang_recurrent_replace"], default="last")
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
         help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
@@ -108,9 +111,17 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
-    if args.text_temporal_pool in ("huang_recurrent_query", "huang_constant_query") and args.seq_len < 30:
-        parser.error("Grouped Huang query modes require seq_len>=30")
-    if args.text_temporal_pool not in ("last", "last_matched") and (args.group_gate != "context_price_only" or args.seq_len < 20):
+    from forecasting_task.models.GroupHuangQuery import HUANG_ALL_MODES, HUANG_DEFAULTS, huang_options
+    try:
+        huang_parameters = huang_options(vars(args))
+    except ValueError as error:
+        parser.error(str(error))
+    if args.text_temporal_pool in HUANG_ALL_MODES:
+        if args.group_gate != "context_price_only" or args.seq_len < args.huang_recurrent_steps + args.huang_attention_lookback:
+            parser.error("Huang requires context_price_only and recurrent_steps + attention_lookback <= seq_len")
+    elif huang_parameters != HUANG_DEFAULTS:
+        parser.error("Nondefault --huang_* parameters require a Huang query mode")
+    if args.text_temporal_pool not in ("last", "last_matched", *HUANG_ALL_MODES) and (args.group_gate != "context_price_only" or args.seq_len < 20):
         parser.error("temporal text modes require context_price_only and seq_len>=20")
     if args.text_temporal_pool == "last_matched" and args.group_gate != "context_price_only":
         parser.error("last_matched requires context_price_only")
@@ -170,9 +181,10 @@ def parse_args(argv=None):
         args.text_model_config["group_gate"] = args.group_gate
         if args.group_gate == "context_price_only":
             from forecasting_task.models.GroupGRUAttention import temporal_structure
-            args.temporal_pool_structure = temporal_structure(args.text_temporal_pool, args.pred_len)
+            parameters = huang_parameters if args.text_temporal_pool in HUANG_ALL_MODES else {}
+            args.temporal_pool_structure = temporal_structure(args.text_temporal_pool, args.pred_len, **parameters)
             args.text_model_config.update(text_temporal_pool=args.text_temporal_pool,
-                                          temporal_pool_structure=args.temporal_pool_structure)
+                                          temporal_pool_structure=args.temporal_pool_structure, **parameters)
         if args.group_gate != "static":
             args.group_weight_mode = args.group_gate
     args.text_mlp_structure = mlp_structure(args.text_hidden_size, args.pred_len, args.text_num_layers)
@@ -395,11 +407,12 @@ def main(argv=None):
         args.temporal_initialization_sha256 = state_fingerprint(text_model.temporal_pool) if hasattr(text_model, "temporal_pool") else None
         args.source_data_evidence = source_data_evidence({"train": train_dataset, "val": val_dataset, "test": test_dataset})
         from forecasting_task.models.HANHeadAblation import ABLATION_MODES, initial_prediction_evidence
-        from forecasting_task.models.GroupHuangQuery import HUANG_MODES
-        if args.text_temporal_pool in HUANG_MODES:
+        from forecasting_task.models.GroupHuangQuery import HUANG_ALL_MODES, HUANG_REPLACE, huang_options
+        if args.text_temporal_pool in HUANG_ALL_MODES:
             args.huang_initialization = {g: state_fingerprint(module, exclude_prefixes=("query",))
                                          for g, module in text_model.temporal_pool.groups.items()}
-            args.initial_prediction_evidence = initial_prediction_evidence(model, text_model, val_dataset, args, device, _prepare_batch)
+            args.initial_prediction_evidence = (None if args.text_temporal_pool == HUANG_REPLACE else
+                                                initial_prediction_evidence(model, text_model, val_dataset, args, device, _prepare_batch))
         if args.text_temporal_pool in ABLATION_MODES:
             args.head_ablation_initialization = {
                 "encoder_input_projection_sha256": state_fingerprint(text_model.temporal_pool.projection) if hasattr(text_model, "temporal_pool") else None,
@@ -561,7 +574,8 @@ def main(argv=None):
                                           initial_prediction_evidence=args.initial_prediction_evidence)
                     if hasattr(args, "huang_initialization"):
                         checkpoint.update(huang_initialization=args.huang_initialization,
-                                          initial_prediction_evidence=args.initial_prediction_evidence)
+                                          initial_prediction_evidence=args.initial_prediction_evidence,
+                                          **huang_options(vars(args)))
 
             checkpoint_path = os.path.join(
                 args.logdir, "best_checkpoint.pt"
@@ -691,7 +705,8 @@ def main(argv=None):
                            initial_prediction_evidence=args.initial_prediction_evidence)
         if hasattr(args, "huang_initialization"):
             summary.update(huang_initialization=args.huang_initialization,
-                           initial_prediction_evidence=args.initial_prediction_evidence)
+                           initial_prediction_evidence=args.initial_prediction_evidence,
+                           **huang_options(vars(args)))
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len
         summary["actual_stride"] = model.patch_embedding.stride

@@ -268,7 +268,7 @@ class ContextNoveltyTextModel(nn.Module):
 def build_text_model(config, group_weight_mode="learnable"):
     config = dict(config)
     temporal_pool = config.pop("text_temporal_pool", "last")
-    if temporal_pool in ("huang_recurrent_query", "huang_constant_query"):
+    if temporal_pool in ("huang_recurrent_query", "huang_constant_query", "huang_recurrent_replace"):
         if group_weight_mode != "context_price_only":
             raise ValueError("Grouped Huang query modes require context_price_only")
         from forecasting_task.models.GroupHuangQuery import GroupHuangQueryTextModel

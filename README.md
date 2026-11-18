@@ -1293,3 +1293,296 @@ docker exec kondyurin-fintexts-compare tail -n 60 -f \
 docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
   python analyze_context_price_huang_query.py
 ```
+
+## Сетка Huang: размер состояния × число рекуррентных шагов
+
+Ветка `experiment/context-price-huang-grid` продолжает реализацию Huang без новых
+классов или режимов для отдельных ячеек. Runner принимает:
+
+```text
+--huang_hidden_size 32
+--huang_recurrent_steps 20
+--huang_attention_lookback 10
+```
+
+Все значения — положительные целые; число шагов плюс lookback должно помещаться
+в ценовое входное окно. Оба query-режима поддерживают параметры, но очередь сетки
+содержит только `huang_recurrent_query`. Нестандартные `--huang_*` для других
+текстовых режимов отклоняются. Старые команды и checkpoint без этих полей
+означают 32/20/10. Формат структуры для этих значений и имена весов сохранены;
+checkpoint восстанавливается без преобразования параметров.
+
+H задаёт размер z/m в пяти независимых LSTMCell, запрос строится проекцией
+H→32, голова поправки имеет размер H→3. Проекции исходного текста остаются
+384→32, запрос — 32D, вход LSTM — 64D, масштаб внимания — sqrt(32).
+При S шагах и L предыдущих строках используется только суффикс длины S+L:
+состояния обновляются на t−S+1,…,t, а внимание шага s видит s−L,…,s−1.
+Например, S=5/L=10 читает t−14,…,t и обновляет состояние на t−4,…,t.
+Маски, замораживание пустых шагов и нулевые головы исторической поправки прежние.
+Текущие головы last, FiLM, price gate, alpha=0.1, blend и протокол обучения
+не изменены. Параметры инициализируются с нуля для каждого нового обучения.
+
+Все три значения сохраняются в args.yaml, text_model_config, checkpoint и summary.
+Диагностика использует фактические S/L и сохраняет веса/даты на каждом шаге,
+подписанные текущие/исторические вклады групп и проверку восстановления прогноза.
+При одном H начальные параметры Huang, включая запрос, совпадают между S=5/20.
+При разных H сверяются общие FiLM, текущие головы и price gate; полный старт
+разных по размеру LSTM не объявляется одинаковым. Порядок батчей общий.
+
+`run_context_price_huang_grid_90.sh` переиспользует проверяемый диспетчер:
+три одноэпоховых NVDA seed7 check, затем 90 новых запусков.
+
+| Каталог конфигурации | H | S | L | Основных запусков |
+|---|---:|---:|---:|---:|
+| h32_s5_l10 | 32 | 5 | 10 | 30 |
+| h16_s20_l10 | 16 | 20 | 10 | 30 |
+| h16_s5_l10 | 16 | 5 | 10 | 30 |
+
+Каждая ячейка: AAPL ABBV ABT ACN ADBE ADI AMAT AMD AMGN AMZN × seeds 7,17,27.
+Все новые запуски передают параметры флагами. Сохранённые 32/20/10 и last_matched
+не переобучаются. Настройки очереди прежние: FiLM, seq64/label16/pred3, batch32,
+Adam lr=0.001, max50, patience10. Сохраняются CUDA-проверка, полный SHA через Git
+или CODE_COMMIT, копии скриптов, OMP/MKL=2, проверка завершённых артефактов,
+возобновление только совпадающих завершённых запусков, START/OK/SKIP, N/90,
+время по ячейкам и ETA. Неполные/несовпадающие каталоги останавливают очередь;
+существующие файлы не перезаписываются.
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_grid_10_v1/
+  checks/{configuration}/NVDA/seed7/{train.log,completed.json,output/}
+  full/{configuration}/{ticker}/seed{seed}/{train.log,completed.json,output/}
+  diagnostics/grid_comparison/
+```
+
+`analyze_context_price_huang_grid.py` переиспользует инспектор и агрегацию
+анализатора query. Контроли:
+
+- H=32/S=20/L=10: `context_price_huang_query_10_v1/full/huang_recurrent_query`;
+- last: `context_price_han_head_ablation_10_v1/full/last_matched`.
+
+Проверяются исходные данные, scaler, настройки, окна/цели/даты validation/test,
+общая инициализация, начальный прогноз и фактический порядок батчей на общих эпохах.
+При одинаковом H дополнительно сверяется отпечаток всей ветви Huang, включая query.
+Различия H/S являются ожидаемыми условиями; разные SHA старой и новой веток допустимы
+при подтверждённых параметрах/данных. Между тремя новыми ячейками SHA совпадает.
+Для каждой пары `window_verification.csv` различает full/partial/mismatch/not_checked.
+Неподтверждённые пары не получают строгих парных разниц или процентов.
+Если старый 32/20/10 подтверждён лишь частично, выбор явно ограничен тремя новыми
+ячейками и не считается строгим выбором по всей сетке. Старые контроли не переобучаются.
+
+Отчёт включает `grid_2x2.csv` для validation MSE и test MSE/MAE, каждый ticker/seed,
+seed-средние и mean/sample std между seed-средними, парные разницы/победы по акциям.
+`effects_by_seed.csv` и `effects_across_seeds.csv` отдельно показывают:
+16 минус 32 при S=5 и S=20; 5 минус 20 при H=16 и H=32.
+Отрицательная разница означает меньшую ошибку у первого условия.
+Выбор — только по validation MSE. Старый отчёт не перезаписывается;
+для повторного анализа используйте новый `--output_dir`.
+
+После отдельной публикации ветки, на astra из host Git checkout:
+
+```bash
+set -euo pipefail
+git fetch origin
+VARIANTS_HOST=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace/variants"}}{{.Source}}{{end}}{{end}}' kondyurin-fintexts-compare)
+test -n "$VARIANTS_HOST"
+WORKTREE="$VARIANTS_HOST/context-price-huang-grid"
+git worktree add --detach "$WORKTREE" origin/experiment/context-price-huang-grid
+CODE_COMMIT=$(git -C "$WORKTREE" rev-parse HEAD)
+CONTAINER_CODE=/workspace/variants/context-price-huang-grid
+
+docker exec kondyurin-fintexts-compare python -c \
+  'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'
+
+docker exec -d -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
+  kondyurin-fintexts-compare bash -lc '
+    set -euo pipefail
+    mkdir -p /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_grid_10_v1
+    exec bash run_context_price_huang_grid_90.sh >> /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_grid_10_v1/queue.log 2>&1
+  '
+
+docker exec kondyurin-fintexts-compare tail -n 60 -f \
+  /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_grid_10_v1/queue.log
+
+# После завершения очереди:
+docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
+  python analyze_context_price_huang_grid.py
+```
+
+Пример отдельного запуска H=16/S=5/L=10 в том же worktree. Каталог должен быть новым:
+
+```bash
+docker exec -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
+  kondyurin-fintexts-compare bash -lc '
+    set -euo pipefail
+    export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+    export PYTHONPATH="$PWD:$PWD/forecasting_task${PYTHONPATH:+:$PYTHONPATH}"
+    python -u -m forecasting_task.run \
+      --root_path /auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts \
+      --data_path AAPL.parquet --model_type FiLM --group_gate context_price_only \
+      --text_temporal_pool huang_recurrent_query \
+      --huang_hidden_size 16 --huang_recurrent_steps 5 --huang_attention_lookback 10 \
+      --used_col_prefixes macro,sector,targetCompany,relatedCompany,filing \
+      --text_num_layers 1 --text_hidden_size 64 --text_weight 0.1 --fusion_mode blend \
+      --group_weight_mode fixed_uniform --seq_len 64 --label_len 16 --pred_len 3 \
+      --batch_size 32 --e_layers 2 --lr 0.001 --num_epoch 50 --patience 10 --seed 7 \
+      --logdir /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_grid_single_v1/output
+  '
+```
+
+## Huang replace: самостоятельная текстовая ветвь, сетка H × steps
+
+Ветка `experiment/context-price-huang-replace-grid` основана на
+`experiment/context-price-huang-query`. Параметризация предыдущей сетки переиспользована.
+**Huang заменяет текстовую ветвь last; last_matched используется только для сравнения.**
+Единственный новый режим — `--text_temporal_pool huang_recurrent_replace`.
+Ни одна ячейка новой очереди не использует additive Huang или обученные старые веса.
+
+Пять независимых групп сохраняют свои U/V 384→32, запрос H→32, LSTMCell(64,H),
+состояние и память. Каждый шаг получает текущую сводку u_s и прошлую сводку
+из masked attention по s−10,…,s−1. На последнем шаге текущий текст t входит
+в LSTM. Состояния начинаются с нуля для каждого окна. Пропуски определяются
+до проекции; пустые шаги сохраняют память. Голова группы — единственная
+Linear(H→3), с прежними нулевыми weight/bias. Если группа не обработала текста,
+маскируется весь выход головы, включая bias.
+
+```text
+text_gh = processed_g * Linear_g(z_gt)
+prediction_h = 0.9 * FiLM_h + 0.1 * last_known_price
+             + 0.1 * sum_g price_weight_g * text_gh
+```
+
+Головы last в этом режиме отсутствуют в state_dict и optimizer и не вызываются
+в forward. Начальный прогноз равен 0.9*FiLM + 0.1*last_price; равенство с
+last_matched не требуется. Порядок RNG общей ценовой модели сохраняется:
+неиспользуемые last-головы удаляются после прежнего порядка инициализации.
+Старые query-режимы и их checkpoint продолжают работать как раньше.
+
+```mermaid
+flowchart TD
+    P["64 нормализованные OHLC-строки"] --> F["FiLM: 3 горизонта × 4 канала"]
+    P --> C["Прежний ценовой контекст: лаги 1 и 5"]
+    C --> G["Прежний gate: softmax по 5 группам"]
+    E["MiniLM 384D: пять отдельных групп"] --> W["Последние S+10 строк входного окна"]
+    W --> M["macro: U/V, query, LSTM"]
+    W --> S["sector: U/V, query, LSTM"]
+    W --> T["targetCompany: U/V, query, LSTM"]
+    W --> R["relatedCompany: U/V, query, LSTM"]
+    W --> I["filing: U/V, query, LSTM"]
+    M --> H["5 отдельных Linear H→3; маска обработанного текста"]
+    S --> H
+    T --> H
+    R --> H
+    I --> H
+    H --> D["Сумма выходов групп с весами gate"]
+    G --> D
+    P --> L["Последний известный OHLC"]
+    F --> B["0.9 FiLM + 0.1 last_price + 0.1 text"]
+    D --> B
+    L --> B
+```
+
+Доступны `--huang_hidden_size`, `--huang_recurrent_steps`, `--huang_attention_lookback`
+с прежними defaults 32/20/10. Положительные целые параметры и S+lookback≤seq_len
+проверяются. H меняет состояние LSTM, запрос H→32 и голову H→3; размер текстовых
+векторов/запроса остаётся 32. S=5 означает t−4,…,t, S=20 — t−19,…,t.
+История каждого шага ограничена предыдущими десятью строками того же 64-строчного
+входа; будущие строки, заполнение пропусков и перенос состояния между окнами
+не используются. Параметры, структура и режим записываются в args/checkpoint/summary.
+
+`run_context_price_huang_replace_grid_120.sh` запускает четыре одноэпоховых
+NVDA seed7 smoke check, затем 120 полных запусков:
+
+| Каталог | H | steps | lookback | Основных запусков |
+|---|---:|---:|---:|---:|
+| h16_s5_l10 | 16 | 5 | 10 | 30 |
+| h16_s20_l10 | 16 | 20 | 10 | 30 |
+| h32_s5_l10 | 32 | 5 | 10 | 30 |
+| h32_s20_l10 | 32 | 20 | 10 | 30 |
+
+Каждая ячейка: AAPL ABBV ABT ACN ADBE ADI AMAT AMD AMGN AMZN × seeds 7,17,27.
+Все четыре ячейки обучаются с нуля. Прежние FiLM, seq64/label16/pred3, batch32,
+price gate [1,5], alpha=0.1, blend, Adam lr=0.001, max50/patience10, scaler,
+разбиения и выбор checkpoint по validation MSE сохранены.
+CUDA, SHA через Git/CODE_COMMIT, копии скриптов, OMP/MKL=2, возобновление только
+подтверждённо завершённых совпадающих запусков, START/OK/SKIP, N/120 и ETA
+переиспользуют общий диспетчер. Частичные/несовпадающие каталоги останавливают
+очередь и сохраняются; обучение с ошибкой выводит хвост train.log.
+
+```text
+/auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_replace_grid_10_v1/
+  checks/{configuration}/NVDA/seed7/{train.log,completed.json,output/}
+  full/{configuration}/{ticker}/seed{seed}/{train.log,completed.json,output/}
+  diagnostics/replace_grid_comparison/
+```
+
+Validation-диагностика лучшего checkpoint сохраняет веса/маски прошлых дат на каждом
+шаге и подписанные `huang_contribution_h*` после gate и alpha. Веса дат не являются
+аддитивным разложением нелинейной LSTM. Таблица компонентов проверяет восстановление
+прогноза из FiLM, anchor и единственной текстовой ветви Huang. Текущая/историческая
+поправки к last в новом режиме не записываются, поскольку такой ветви нет.
+
+`analyze_context_price_huang_replace_grid.py` сравнивает четыре новые ячейки и
+сохранённый `context_price_han_head_ablation_10_v1/full/last_matched`.
+Проверяет данные, scaler, настройки, разбиения, ценовые окна/цели/даты, начальные
+FiLM/gate и порядок батчей на общих эпохах. При одинаковом H сверяет полный старт
+Huang, включая query. Совпадение текстовых голов Huang/last и начальных прогнозов
+не требуется. Старый additive Huang не служит ни ячейкой, ни контролем новой сетки.
+При неполных исторических доказательствах сравнение с last явно отмечается partial;
+строгие парные разницы для неподтверждённых пар не рассчитываются. Контроль не
+переобучается автоматически. Отчёт: validation MSE, test MSE/MAE, 2×2, seed-средние,
+mean/sample std, парные разницы/победы по акциям и seeds, эффекты H при фиксированном S
+и S при фиксированном H. Выбор ячейки — только по validation MSE. Отдельно
+`including_last` выбирает лучший вариант среди сетки и last, только если
+сопоставимость контроля подтверждена; при partial этот выбор не делается. Отчёты не
+перезаписываются; для повторного анализа укажите новый `--output_dir`.
+
+После отдельной публикации ветки, на astra из host Git checkout:
+
+```bash
+set -euo pipefail
+git fetch origin
+VARIANTS_HOST=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace/variants"}}{{.Source}}{{end}}{{end}}' kondyurin-fintexts-compare)
+test -n "$VARIANTS_HOST"
+WORKTREE="$VARIANTS_HOST/context-price-huang-replace-grid"
+git worktree add --detach "$WORKTREE" origin/experiment/context-price-huang-replace-grid
+CODE_COMMIT=$(git -C "$WORKTREE" rev-parse HEAD)
+CONTAINER_CODE=/workspace/variants/context-price-huang-replace-grid
+
+docker exec kondyurin-fintexts-compare python -c \
+  'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'
+
+docker exec -d -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
+  kondyurin-fintexts-compare bash -lc '
+    set -euo pipefail
+    mkdir -p /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_replace_grid_10_v1
+    exec bash run_context_price_huang_replace_grid_120.sh >> /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_replace_grid_10_v1/queue.log 2>&1
+  '
+
+docker exec kondyurin-fintexts-compare tail -n 60 -f \
+  /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_replace_grid_10_v1/queue.log
+
+# После завершения очереди:
+docker exec -w "$CONTAINER_CODE" kondyurin-fintexts-compare \
+  python analyze_context_price_huang_replace_grid.py
+```
+
+Одиночный запуск в том же контейнере, в новом отдельном каталоге:
+
+```bash
+docker exec -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
+  kondyurin-fintexts-compare bash -lc '
+    set -euo pipefail
+    export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+    export PYTHONPATH="$PWD:$PWD/forecasting_task${PYTHONPATH:+:$PYTHONPATH}"
+    python -u -m forecasting_task.run \
+      --root_path /auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts \
+      --data_path AAPL.parquet --model_type FiLM --group_gate context_price_only \
+      --text_temporal_pool huang_recurrent_replace \
+      --huang_hidden_size 16 --huang_recurrent_steps 5 --huang_attention_lookback 10 \
+      --used_col_prefixes macro,sector,targetCompany,relatedCompany,filing \
+      --text_num_layers 1 --text_hidden_size 64 --text_weight 0.1 --fusion_mode blend \
+      --group_weight_mode fixed_uniform --seq_len 64 --label_len 16 --pred_len 3 \
+      --batch_size 32 --e_layers 2 --lr 0.001 --num_epoch 50 --patience 10 --seed 7 \
+      --logdir /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_replace_single_v1/output
+  '
+```

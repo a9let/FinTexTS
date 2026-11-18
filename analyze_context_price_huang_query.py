@@ -10,7 +10,7 @@ import torch
 
 import analyze_context_price_han_head_ablation as heads
 from analyze_persistence_baseline import Run
-from forecasting_task.models.GroupHuangQuery import HUANG_MODES
+from forecasting_task.models.GroupHuangQuery import HUANG_MODES, HUANG_ALL_MODES, HUANG_REPLACE, huang_options
 from forecasting_task.models.GroupText import TEXT_GROUPS
 from run_han_head_ablation_queue import file_hash
 
@@ -50,20 +50,22 @@ def inspect(run, cache):
             raise ValueError('Source Parquet differs')
         summary = json.loads((run.output / 'summary.json').read_text())
         checkpoint = torch.load(run.output / 'best_checkpoint.pt', map_location='cpu', weights_only=True)
-        for key in (('huang_initialization', 'initial_prediction_evidence') if run.variant in HUANG_MODES else ('initial_prediction_evidence',)):
+        for key in (('huang_initialization', 'initial_prediction_evidence', 'temporal_initialization_sha256')
+                    if run.variant in HUANG_ALL_MODES else ('initial_prediction_evidence',)):
             if any(key not in source for source in (args, summary, checkpoint)):
                 raise KeyError(f'Missing {key}')
             if args[key] != summary[key] or args[key] != checkpoint[key]:
                 raise ValueError(f'Inconsistent {key}')
         proof = args['initial_prediction_evidence']
-        if (not proof or proof.get('matches_last_matched_formula') is not True or proof.get('max_abs_difference') != 0
+        if run.variant != HUANG_REPLACE and (not proof or proof.get('matches_last_matched_formula') is not True or proof.get('max_abs_difference') != 0
                 or proof.get('input_end_date') != metadata['datasets']['val'].window_end_date(0)):
             raise ValueError('Initial last-formula equality unconfirmed')
-        digests = [proof.get('prediction_sha256', '')]
-        if run.variant in HUANG_MODES:
+        digests = [] if run.variant == HUANG_REPLACE else [proof.get('prediction_sha256', '')]
+        if run.variant in HUANG_ALL_MODES:
             if set(args['huang_initialization']) != set(TEXT_GROUPS):
                 raise ValueError('Missing per-group common news initialization')
             digests.extend(args['huang_initialization'].values())
+            digests.append(args['temporal_initialization_sha256'])
         for digest in digests:
             if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
                 raise ValueError('Invalid initialization/prediction fingerprint')
@@ -74,7 +76,8 @@ def inspect(run, cache):
     return result
 
 
-def compare_pair(left, right):
+def compare_pair(left, right, *, allow_architecture_difference=False, require_same_code=True,
+                 compare_text_heads=True, compare_initial_prediction=True):
     epochs = heads.compare_common(left, right)
     a, b = left[1]['args'], right[1]['args']
     for key in ('d_model', 'dropout', 'novelty_policy', 'sampling_policy', 'gate_structure'):
@@ -82,19 +85,22 @@ def compare_pair(left, right):
             raise KeyError(f'Missing common setting: {key}')
         if a[key] != b[key]:
             raise ValueError(f'Common setting differs: {key}')
-    if a['common_initialization'] != b['common_initialization']:
+    if compare_text_heads and a['common_initialization'] != b['common_initialization']:
         raise ValueError('Initial FiLM/current heads/price gate differ')
-    if a['initial_prediction_evidence'] != b['initial_prediction_evidence']:
+    if compare_initial_prediction and a['initial_prediction_evidence'] != b['initial_prediction_evidence']:
         raise ValueError('Actual initial predictions or dates differ')
-    if left[0]['variant'] in HUANG_MODES and right[0]['variant'] in HUANG_MODES:
-        if a['code_commit'] != b['code_commit']:
+    if a.get('text_temporal_pool', left[0]['variant']) in HUANG_ALL_MODES and b.get('text_temporal_pool', right[0]['variant']) in HUANG_ALL_MODES:
+        options_a, options_b = huang_options(a), huang_options(b)
+        if not allow_architecture_difference and options_a != options_b:
+            raise ValueError('Huang parameters differ in a query-source comparison')
+        if require_same_code and a['code_commit'] != b['code_commit']:
             raise ValueError('Code SHA differs between new query modes')
-        if a['huang_initialization'] != b['huang_initialization']:
+        if options_a['huang_hidden_size'] == options_b['huang_hidden_size'] and a['huang_initialization'] != b['huang_initialization']:
             raise ValueError('Initial shared U/V, LSTM cells or correction heads differ')
     return epochs
 
 
-def verify_pair(left, right):
+def verify_pair(left, right, *, comparator=compare_pair):
     a, b = left[0], right[0]
     row = {'left': a['variant'], 'right': b['variant'], 'ticker': a['ticker'], 'seed': a['seed'],
            'window_verification': 'not_checked', 'common_epochs': None, 'reason': ''}
@@ -105,7 +111,7 @@ def verify_pair(left, right):
                                     for r in (a, b) if not r['comparable']])
     else:
         try:
-            row['common_epochs'] = compare_pair(left, right)
+            row['common_epochs'] = comparator(left, right)
             row['window_verification'] = 'full'
         except KeyError as error:
             row.update(window_verification='partial', reason=str(error))
@@ -114,9 +120,9 @@ def verify_pair(left, right):
     return row
 
 
-def aggregate(rows, verification):
-    by_seed, across, by_ticker, pairs, per_run_pairs, wins = [], [], [], [], [], []
-    for mode in MODES:
+def aggregate(rows, verification, *, modes=MODES, pairs=PAIRS, selection_modes=HUANG_MODES):
+    by_seed, across, by_ticker, paired_tickers, per_run_pairs, wins = [], [], [], [], [], []
+    for mode in modes:
         for seed in SEEDS:
             group = [r for r in rows if r['variant'] == mode and r['seed'] == seed]
             by_seed.append({'variant': mode, 'seed': seed, 'verified_runs': sum(r['comparable'] for r in group),
@@ -138,7 +144,7 @@ def aggregate(rows, verification):
             valid = check['window_verification'] == 'full' and a is not None and b is not None
             per_run_pairs.append({**check, 'metric': metric, 'left_error': a, 'right_error': b,
                                   'difference': a - b if valid else None})
-    for left, right in PAIRS:
+    for left, right in pairs:
         for metric in METRICS:
             differences = []
             for ticker in TICKERS:
@@ -146,22 +152,23 @@ def aggregate(rows, verification):
                 a, b = lookup[left, ticker][metric], lookup[right, ticker][metric]
                 valid = len(checks) == 3 and all(r['window_verification'] == 'full' for r in checks) and a is not None and b is not None
                 difference = a - b if valid else None
-                pairs.append({'left': left, 'right': right, 'ticker': ticker, 'metric': metric, 'comparable': valid,
+                paired_tickers.append({'left': left, 'right': right, 'ticker': ticker, 'metric': metric, 'comparable': valid,
                               'left_seed_mean': a, 'right_seed_mean': b, 'difference': difference,
                               'improvement_pct': 100 * (b - a) / b if valid and b else None})
                 if valid:
                     differences.append(difference)
             wins.append({'left': left, 'right': right, 'metric': metric, 'eligible_tickers': len(differences),
                          'left_wins': sum(d < 0 for d in differences), 'right_wins': sum(d > 0 for d in differences), 'ties': sum(d == 0 for d in differences)})
-    primary = [r for r in verification if (r['left'], r['right']) == HUANG_MODES]
-    valid = len(primary) == 30 and all(r['window_verification'] == 'full' for r in primary)
-    scores = {r['variant']: r['mean'] for r in across if r['metric'] == 'val_mse' and r['variant'] in HUANG_MODES}
-    valid = valid and len(scores) == 2 and None not in scores.values()
+    primary = [r for r in verification if r['left'] in selection_modes and r['right'] in selection_modes]
+    count = len(selection_modes) * (len(selection_modes) - 1) // 2 * len(TICKERS) * len(SEEDS)
+    valid = len(primary) == count and all(r['window_verification'] == 'full' for r in primary)
+    scores = {r['variant']: r['mean'] for r in across if r['metric'] == 'val_mse' and r['variant'] in selection_modes}
+    valid = valid and len(scores) == len(selection_modes) and None not in scores.values()
     selection = {'status': 'full' if valid else 'blocked', 'metric': 'val_mse', 'scores': scores,
                  'selected': [m for m, v in scores.items() if v == min(scores.values())] if valid else [],
                  'test_used_for_selection': False, 'last_retrained': False,
                  'last_comparison': 'full' if all(r['window_verification'] == 'full' for r in verification if r['right'] == LAST) else 'partial'}
-    return {'by_seed': by_seed, 'across_seeds': across, 'per_ticker': by_ticker, 'paired_by_run': per_run_pairs, 'paired_by_ticker': pairs, 'wins': wins}, selection
+    return {'by_seed': by_seed, 'across_seeds': across, 'per_ticker': by_ticker, 'paired_by_run': per_run_pairs, 'paired_by_ticker': paired_tickers, 'wins': wins}, selection
 
 
 def analyze(results_root=DEFAULT_RESULTS, reference_root=DEFAULT_REFERENCE, data_root=heads.han.prior.DEFAULT_DATA, output_dir=None):

@@ -18,7 +18,7 @@ import yaml
 
 from forecasting_task.models.GroupText import TEXT_GROUPS, build_text_model
 from forecasting_task.models.HANHeadAblation import ABLATION_MODES
-from forecasting_task.models.GroupHuangQuery import HUANG_MODES
+from forecasting_task.models.GroupHuangQuery import HUANG_MODES, HUANG_ALL_MODES, HUANG_REPLACE, huang_options
 from forecasting_task.models.GroupGRUAttention import temporal_structure
 from forecasting_task.window_evidence import SPLIT_POLICY
 
@@ -48,10 +48,13 @@ def jobs(modes=ABLATION_MODES):
     return checks + full
 
 
-def expected_config(mode, ticker, seed, epochs, commit, data):
-    return {**SETTINGS, 'text_temporal_pool': mode, 'ticker': ticker, 'seed': seed, 'num_epoch': epochs,
+def expected_config(mode, ticker, seed, epochs, commit, data, configuration=None):
+    settings = dict(SETTINGS, **(configuration or {}))
+    actual_mode = settings.pop('text_temporal_pool', mode)
+    parameters = huang_options(settings) if actual_mode in HUANG_ALL_MODES else {}
+    return {**settings, 'text_temporal_pool': actual_mode, 'ticker': ticker, 'seed': seed, 'num_epoch': epochs,
             'code_commit': commit, 'root_path': str(Path(data).resolve()),
-            'used_col_prefixes': list(TEXT_GROUPS), 'structure': temporal_structure(mode, SETTINGS['pred_len'])}
+            'used_col_prefixes': list(TEXT_GROUPS), 'structure': temporal_structure(actual_mode, settings['pred_len'], **parameters)}
 
 
 def validate_completed(destination, expected):
@@ -79,13 +82,17 @@ def validate_completed(destination, expected):
     for key in ('code_commit', 'text_temporal_pool', 'seed'):
         if summary.get(key) != expected[key]:
             raise ValueError(f'{destination}: summary {key} differs')
-    initialization_key = 'huang_initialization' if expected['text_temporal_pool'] in HUANG_MODES else 'head_ablation_initialization'
+    initialization_key = 'huang_initialization' if expected['text_temporal_pool'] in HUANG_ALL_MODES else 'head_ablation_initialization'
     for key in ('window_evidence', 'source_data_evidence', 'common_initialization', initialization_key,
                 'initial_prediction_evidence', 'temporal_initialization_sha256', 'split_policy', 'temporal_pool_structure'):
         if key not in args or key not in summary or key not in checkpoint or args[key] != summary[key] or args[key] != checkpoint[key]:
             raise ValueError(f'{destination}: inconsistent saved {key}')
     if args['split_policy'] != SPLIT_POLICY or args['temporal_pool_structure'] != expected['structure']:
         raise ValueError(f'{destination}: split/architecture mismatch')
+    if expected['text_temporal_pool'] in HUANG_ALL_MODES:
+        for source in (args, summary, checkpoint, args['text_model_config']):
+            if huang_options(source) != huang_options(expected):
+                raise ValueError(f'{destination}: Huang parameters differ')
     data_file = Path(expected['root_path']) / (expected['ticker'] + '.parquet')
     if args['source_data_evidence'].get('parquet_sha256') != file_hash(data_file):
         raise ValueError(f'{destination}: source Parquet changed')
@@ -113,6 +120,8 @@ def validate_completed(destination, expected):
     with torch.random.fork_rng(devices=[]):
         text = build_text_model(args['text_model_config'], args['group_weight_mode'])
         text.load_state_dict(checkpoint['text_model_state_dict'], strict=True)
+    if expected['text_temporal_pool'] == HUANG_REPLACE and any(name.startswith('group_mlps.') for name in checkpoint['text_model_state_dict']):
+        raise ValueError(f'{destination}: replace checkpoint contains last heads')
     if expected['text_temporal_pool'] in ('last_matched', 'last_han_h32_residual', *HUANG_MODES):
         proof = args['initial_prediction_evidence']
         if not proof or proof.get('matches_last_matched_formula') is not True or proof.get('max_abs_difference') != 0:
@@ -160,12 +169,16 @@ def record_file(path, content):
             handle.write(content)
 
 
-def training_command(mode, ticker, seed, epochs, commit, data, output):
+def training_command(mode, ticker, seed, epochs, commit, data, output, configuration=None):
     command = [sys.executable, '-u', '-m', 'forecasting_task.run']
     for key, value in SETTINGS.items():
         command.extend(['--' + key, str(value)])
+    configuration = configuration or {}
+    if configuration:
+        for key, value in huang_options(configuration).items():
+            command.extend(['--' + key, str(value)])
     command.extend(['--root_path', str(data), '--data_path', ticker + '.parquet', '--group_weight_mode', 'fixed_uniform',
-                    '--text_temporal_pool', mode, '--used_col_prefixes', ','.join(TEXT_GROUPS),
+                    '--text_temporal_pool', configuration.get('text_temporal_pool', mode), '--used_col_prefixes', ','.join(TEXT_GROUPS),
                     '--num_epoch', str(epochs), '--seed', str(seed), '--code_commit', commit, '--logdir', str(output)])
     return command
 
@@ -196,7 +209,7 @@ def print_timing(markers, modes=ABLATION_MODES):
           f'overall_mean_fallback_modes={",".join(fallback)}', flush=True)
 
 
-def run_queue(code, data=DATA, results=RESULTS, commit=None, *, modes=ABLATION_MODES, scripts=None):
+def run_queue(code, data=DATA, results=RESULTS, commit=None, *, modes=ABLATION_MODES, scripts=None, configurations=None):
     total = len(modes) * len(TICKERS) * len(SEEDS)
     code, data, results = Path(code), Path(data).resolve(), Path(results)
     for ticker in (*TICKERS, 'NVDA'):
@@ -219,11 +232,13 @@ def run_queue(code, data=DATA, results=RESULTS, commit=None, *, modes=ABLATION_M
     for name in (scripts or ('run_context_price_han_head_ablation_150.sh', Path(__file__).name)):
         record_file(results / name, (code / name).read_bytes())
     planned, markers = jobs(modes), {}
+    def options(mode):
+        return {'configuration': configurations[mode]} if configurations is not None else {}
     for job in planned:
         stage, mode, ticker, seed, epochs = job
         destination = results / stage / mode / ticker / f'seed{seed}'
         if destination.exists():
-            markers[job] = completion(destination, expected_config(mode, ticker, seed, epochs, commit, data))
+            markers[job] = completion(destination, expected_config(mode, ticker, seed, epochs, commit, data, **options(mode)))
     completed = sum(job[0] == 'full' for job in markers)
     print_timing(markers, modes)
     for job in planned:
@@ -236,12 +251,12 @@ def run_queue(code, data=DATA, results=RESULTS, commit=None, *, modes=ABLATION_M
         destination.mkdir()
         print(f'START stage={stage} mode={mode} ticker={ticker} seed={seed} completed={completed}/{total}', flush=True)
         started = time.monotonic()
-        status = execute_training(training_command(mode, ticker, seed, epochs, commit, data, destination / 'output'), destination / 'train.log', code)
+        status = execute_training(training_command(mode, ticker, seed, epochs, commit, data, destination / 'output', **options(mode)), destination / 'train.log', code)
         if status:
             tail = (destination / 'train.log').read_text(encoding='utf-8', errors='replace').splitlines()[-30:]
             print('\n'.join(tail), file=sys.stderr, flush=True)
             raise subprocess.CalledProcessError(status, str(destination))
-        markers[job] = completion(destination, expected_config(mode, ticker, seed, epochs, commit, data), time.monotonic() - started)
+        markers[job] = completion(destination, expected_config(mode, ticker, seed, epochs, commit, data, **options(mode)), time.monotonic() - started)
         if stage == 'full':
             completed += 1
         print(f'OK stage={stage} mode={mode} ticker={ticker} seed={seed} completed={completed}/{total}', flush=True)
@@ -252,14 +267,14 @@ def run_queue(code, data=DATA, results=RESULTS, commit=None, *, modes=ABLATION_M
     return markers
 
 
-def cli(*, results=RESULTS, modes=ABLATION_MODES, scripts=None):
+def cli(*, results=RESULTS, modes=ABLATION_MODES, scripts=None, configurations=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--code', type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument('--data', type=Path, default=DATA)
     parser.add_argument('--results', type=Path, default=results)
     args = parser.parse_args()
     try:
-        run_queue(args.code, args.data, args.results, modes=modes, scripts=scripts)
+        run_queue(args.code, args.data, args.results, modes=modes, scripts=scripts, configurations=configurations)
     except subprocess.CalledProcessError as error:
         print(f'FAILED exit={error.returncode}: {error.cmd}; incomplete files preserved', file=sys.stderr)
         raise SystemExit(error.returncode)
