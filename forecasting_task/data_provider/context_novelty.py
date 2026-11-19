@@ -50,10 +50,11 @@ def causal_novelty(embeddings):
 class ContextNoveltyDataset(Dataset):
     """Append last-input-day novelty/pair features to the original six fields."""
 
-    def __init__(self, base):
+    def __init__(self, base, include_calendar_days=False):
         if base.seq_len < 6 or tuple(base.used_col_prefixes) != TEXT_GROUPS:
             raise ValueError("group_gate requires seq_len>=6 and all five ordered groups")
         self.base = base
+        self.include_calendar_days = include_calendar_days
         self.seq_len, self.label_len, self.pred_len = base.seq_len, base.label_len, base.pred_len
         self.scaler = base.scaler
         frame = pd.read_parquet(os.path.join(base.root_path, base.data_path))
@@ -94,7 +95,10 @@ class ContextNoveltyDataset(Dataset):
 
     def __getitem__(self, index):
         row = index + self.seq_len - 1
-        return (*self.base[index], {"novelty": self.novelty[row], "pair_available": self.pair_available[row]})
+        metadata = {"novelty": self.novelty[row], "pair_available": self.pair_available[row]}
+        if self.include_calendar_days:
+            metadata['calendar_days'] = self.row_dates[index:index + self.seq_len].astype('datetime64[D]').astype(np.int64)
+        return (*self.base[index], metadata)
 
     def window_end_date(self, index):
         return str(self.row_dates[int(index) + self.seq_len - 1])
@@ -104,6 +108,7 @@ class ContextNoveltyDataset(Dataset):
 
 
 def get_context_novelty_dataloader(batch_size, **kwargs):
-    dataset = ContextNoveltyDataset(Dataset_Custom(**kwargs))
+    include_days = kwargs.pop('include_calendar_days', False)
+    dataset = ContextNoveltyDataset(Dataset_Custom(**kwargs), include_calendar_days=include_days)
     train = kwargs["flag"] == "train"
     return dataset, DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=1, drop_last=train)

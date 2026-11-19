@@ -11,22 +11,24 @@ from forecasting_task.models.GroupHANTemporal import GroupHANPool
 
 
 ABLATION_MODES = ('last_matched', 'han_h32_linear', 'han_h16_linear', 'han_h32_mlp', 'last_han_h32_residual')
+HAN_WINDOW_MODES = ('han_h16_linear_w5', 'han_h16_linear_w10')
 
 
 def head_ablation_structure(mode, pred_len=3):
-    if mode not in ABLATION_MODES:
+    if mode not in (*ABLATION_MODES, *HAN_WINDOW_MODES):
         raise ValueError(f'Unknown HAN head ablation: {mode}')
-    hidden = 16 if mode == 'han_h16_linear' else 32
+    hidden = 16 if mode in ('han_h16_linear', *HAN_WINDOW_MODES) else 32
+    rows = {'han_h16_linear_w5': 5, 'han_h16_linear_w10': 10}.get(mode, 20)
     state = 2 * hidden
     legacy = mode in ('last_matched', 'last_han_h32_residual')
     head = [{'type': 'Linear', 'in_features': 384 if legacy else state,
              'out_features': 16 if mode == 'han_h32_mlp' else pred_len}]
     if mode == 'han_h32_mlp':
         head.extend([{'type': 'GELU'}, {'type': 'Linear', 'in_features': 16, 'out_features': pred_len}])
-    return {'mode': mode, 'rows': 1 if mode == 'last_matched' else 20,
-            'history_used_rows': 19 if mode == 'last_han_h32_residual' else 0 if mode == 'last_matched' else 20,
+    return {'mode': mode, 'rows': 1 if mode == 'last_matched' else rows,
+            'history_used_rows': 19 if mode == 'last_han_h32_residual' else 0 if mode == 'last_matched' else rows,
             'include_current_in_history': mode not in ('last_matched', 'last_han_h32_residual'),
-            'original_position_indices': [19] if mode == 'last_matched' else list(range(19 if mode == 'last_han_h32_residual' else 20)),
+            'original_position_indices': [19] if mode == 'last_matched' else list(range(20 - rows, 19 if mode == 'last_han_h32_residual' else 20)),
             'input_projection': None if mode == 'last_matched' else [384, 32],
             'hidden_per_direction': None if mode == 'last_matched' else hidden,
             'state_size': 384 if mode == 'last_matched' else state,
@@ -52,7 +54,8 @@ class HANHeadAblationTextModel(ContextNoveltyTextModel):
         hidden = expected['hidden_per_direction']
         # Encoder creation precedes the condition-specific heads in every mode.
         with torch.random.fork_rng(devices=[]):
-            self.temporal_pool = GroupHANPool('group_han_temporal', hidden_size=hidden, output_projection=False)
+            self.temporal_pool = GroupHANPool('group_han_temporal', hidden_size=hidden, output_projection=False,
+                                              window_size=expected['rows'])
         with torch.random.fork_rng(devices=[]):
             if text_temporal_pool == 'last_han_h32_residual':
                 self.history_heads = nn.ModuleDict({g: nn.Linear(64, self.pred_len) for g in TEXT_GROUPS})

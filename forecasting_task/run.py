@@ -72,13 +72,17 @@ def parse_args(argv=None):
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
     parser.add_argument("--group_gate", choices=["static", "context_novelty", "context_no_novelty", "context_price_only"], default=None,
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
+    parser.add_argument("--text_family", choices=["han", "huang", "tlstm", "last"], default=None)
+    parser.add_argument("--family_hidden_size", type=int, choices=[16, 32], default=32)
+    parser.add_argument("--text_window", type=int, choices=[5, 20], default=20)
+    parser.add_argument("--group_weight_condition", choices=["price_only", "uniform"], default="price_only")
     parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
     parser.add_argument("--huang_hidden_size", type=int, default=32)
     parser.add_argument("--huang_recurrent_steps", type=int, default=20)
     parser.add_argument("--huang_attention_lookback", type=int, default=10)
     parser.add_argument("--text_temporal_pool", choices=["last", "group_gru_attention", "group_han_temporal", "group_han_uniform",
                         "last_matched", "han_h32_linear", "han_h16_linear", "han_h32_mlp", "last_han_h32_residual",
-                        "huang_recurrent_query", "huang_constant_query", "huang_recurrent_replace"], default="last")
+                        "huang_recurrent_query", "huang_constant_query", "huang_recurrent_replace", "group_gate_experiment"], default="last")
     parser.add_argument(
         "--initial_group_weights", type=float, nargs="+", default=None,
         help="Positive weights summing to 1, in --used_col_prefixes order; default: uniform",
@@ -111,6 +115,17 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.text_family is not None:
+        if args.text_temporal_pool not in ('last', 'group_gate_experiment') or args.group_gate not in (None, 'context_price_only'):
+            parser.error('--text_family cannot override an existing architecture or gate condition')
+        if args.text_family == 'last' and (args.family_hidden_size != 32 or args.text_window != 20):
+            parser.error('last controls use the default placeholders H=32/window=20 and read only the last row')
+        args.text_temporal_pool = "group_gate_experiment"
+        args.group_gate = "context_price_only"
+        if args.seq_len < (args.text_window + (10 if args.text_family == "huang" else 0)):
+            parser.error("Text history exceeds the price input window")
+    elif args.group_weight_condition != 'price_only' or args.family_hidden_size != 32 or args.text_window != 20:
+        parser.error('Family parameters require --text_family')
     from forecasting_task.models.GroupHuangQuery import HUANG_ALL_MODES, HUANG_DEFAULTS, huang_options
     try:
         huang_parameters = huang_options(vars(args))
@@ -182,7 +197,15 @@ def parse_args(argv=None):
         if args.group_gate == "context_price_only":
             from forecasting_task.models.GroupGRUAttention import temporal_structure
             parameters = huang_parameters if args.text_temporal_pool in HUANG_ALL_MODES else {}
-            args.temporal_pool_structure = temporal_structure(args.text_temporal_pool, args.pred_len, **parameters)
+            if args.text_family is not None:
+                from forecasting_task.models.GroupGateExperiment import experiment_structure
+                parameters = dict(text_family=args.text_family, family_hidden_size=args.family_hidden_size,
+                                  text_window=args.text_window, group_weight_condition=args.group_weight_condition)
+                args.temporal_pool_structure = experiment_structure(args.text_family, args.family_hidden_size, args.text_window, args.group_weight_condition, args.pred_len)
+                if args.group_weight_condition == "uniform":
+                    args.gate_structure = None
+            else:
+                args.temporal_pool_structure = temporal_structure(args.text_temporal_pool, args.pred_len, **parameters)
             args.text_model_config.update(text_temporal_pool=args.text_temporal_pool,
                                           temporal_pool_structure=args.temporal_pool_structure, **parameters)
         if args.group_gate != "static":
@@ -329,6 +352,9 @@ def main(argv=None):
     if args.group_gate:
         from forecasting_task.data_provider.context_novelty import get_context_novelty_dataloader
         loader_factory = get_context_novelty_dataloader
+        if args.text_family is not None:
+            from functools import partial
+            loader_factory = partial(loader_factory, include_calendar_days=True)
     train_dataset, train_dataloader = loader_factory(
         seq_len=args.seq_len,
         label_len=args.label_len,
@@ -406,6 +432,9 @@ def main(argv=None):
         args.common_initialization = common_initialization(model, text_model)
         args.temporal_initialization_sha256 = state_fingerprint(text_model.temporal_pool) if hasattr(text_model, "temporal_pool") else None
         args.source_data_evidence = source_data_evidence({"train": train_dataset, "val": val_dataset, "test": test_dataset})
+        if args.text_family is not None:
+            args.initial_prediction_evidence = None
+            args.experiment_initialization = state_fingerprint(text_model.core, exclude_prefixes=("gate.",))
         from forecasting_task.models.HANHeadAblation import ABLATION_MODES, initial_prediction_evidence
         from forecasting_task.models.GroupHuangQuery import HUANG_ALL_MODES, HUANG_REPLACE, huang_options
         if args.text_temporal_pool in HUANG_ALL_MODES:
@@ -569,6 +598,10 @@ def main(argv=None):
                                       temporal_initialization_sha256=args.temporal_initialization_sha256,
                                       source_data_evidence=args.source_data_evidence,
                                       train_batch_orders=[r["train_batch_order"] for r in history])
+                    if args.text_family is not None:
+                        checkpoint.update(experiment_initialization=args.experiment_initialization, initial_prediction_evidence=None,
+                                          text_family=args.text_family, family_hidden_size=args.family_hidden_size,
+                                          text_window=args.text_window, group_weight_condition=args.group_weight_condition)
                     if hasattr(args, "head_ablation_initialization"):
                         checkpoint.update(head_ablation_initialization=args.head_ablation_initialization,
                                           initial_prediction_evidence=args.initial_prediction_evidence)
@@ -700,6 +733,10 @@ def main(argv=None):
         summary.update(common_initialization=args.common_initialization, source_data_evidence=args.source_data_evidence,
                        temporal_initialization_sha256=args.temporal_initialization_sha256,
                        train_batch_orders=[r["train_batch_order"] for r in history])
+        if args.text_family is not None:
+            summary.update(experiment_initialization=args.experiment_initialization, initial_prediction_evidence=None, text_family=args.text_family,
+                           family_hidden_size=args.family_hidden_size, text_window=args.text_window,
+                           group_weight_condition=args.group_weight_condition)
         if hasattr(args, "head_ablation_initialization"):
             summary.update(head_ablation_initialization=args.head_ablation_initialization,
                            initial_prediction_evidence=args.initial_prediction_evidence)

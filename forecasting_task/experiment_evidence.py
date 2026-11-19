@@ -21,7 +21,7 @@ def state_fingerprint(module, exclude_prefixes=()):
 def common_initialization(model, text_model):
     return {"film_sha256": state_fingerprint(model),
             "heads_sha256": state_fingerprint(text_model.group_mlps),
-            "price_gate_sha256": state_fingerprint(text_model.gate)}
+            "price_gate_sha256": state_fingerprint(text_model.gate) if text_model.gate is not None else None}
 
 
 def source_data_evidence(datasets):

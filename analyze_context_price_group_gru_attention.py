@@ -45,6 +45,9 @@ class ReplayCache:
 
 
 def configuration_issues(run, summary, args, checkpoint, reference):
+    if args.get('text_temporal_pool') == 'group_gate_experiment':
+        from group_gate_audit import configuration_issues as experiment_issues
+        return experiment_issues(run, summary, args, checkpoint)
     missing, mismatch = [], []
     expected = {**COMMON, 'model_type': 'FiLM', 'used_col_prefixes': list(TEXT_GROUPS), 'text_weight': .1}
     if reference is not None:

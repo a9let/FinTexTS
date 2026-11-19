@@ -1,0 +1,17 @@
+[
+  {
+    "path": "forecasting_task/models/GroupHANTemporal.py",
+    "source_commit": "6a62808d21b69beb85f05e47fe232fb055dd2ec4",
+    "sha256_lf": "5cdfc1c907a0707a70b6d1364a4c58d7f41a1a9801de2eec9401fb08b53b8dc7"
+  },
+  {
+    "path": "forecasting_task/models/HANHeadAblation.py",
+    "source_commit": "6a62808d21b69beb85f05e47fe232fb055dd2ec4",
+    "sha256_lf": "03d1da6b78e051e915c2af3fa1119e428cbb0e0ef94e6b0d06f2b9b4b65a7234"
+  },
+  {
+    "path": "forecasting_task/models/GroupHuangQuery.py",
+    "source_commit": "e642a6df9a020a65c364bac2426839c2ed538584",
+    "sha256_lf": "30bdad4fb8b94c8aa59cfa107e9d41004c34466d7d24356c4fbbb03eea3e68c7"
+  }
+]

@@ -21,6 +21,7 @@ from forecasting_task.models.HANHeadAblation import ABLATION_MODES
 from forecasting_task.models.GroupHuangQuery import HUANG_MODES, HUANG_ALL_MODES, HUANG_REPLACE, huang_options
 from forecasting_task.models.GroupGRUAttention import temporal_structure
 from forecasting_task.window_evidence import SPLIT_POLICY
+from forecasting_task.models.GroupGateExperiment import experiment_structure
 
 
 DATA = Path('/auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts')
@@ -54,7 +55,7 @@ def expected_config(mode, ticker, seed, epochs, commit, data, configuration=None
     parameters = huang_options(settings) if actual_mode in HUANG_ALL_MODES else {}
     return {**settings, 'text_temporal_pool': actual_mode, 'ticker': ticker, 'seed': seed, 'num_epoch': epochs,
             'code_commit': commit, 'root_path': str(Path(data).resolve()),
-            'used_col_prefixes': list(TEXT_GROUPS), 'structure': temporal_structure(actual_mode, settings['pred_len'], **parameters)}
+            'used_col_prefixes': list(TEXT_GROUPS), 'structure': (experiment_structure(settings['text_family'], settings['family_hidden_size'], settings['text_window'], settings['group_weight_condition'], settings['pred_len']) if actual_mode == 'group_gate_experiment' else temporal_structure(actual_mode, settings['pred_len'], **parameters))}
 
 
 def validate_completed(destination, expected):
@@ -82,7 +83,7 @@ def validate_completed(destination, expected):
     for key in ('code_commit', 'text_temporal_pool', 'seed'):
         if summary.get(key) != expected[key]:
             raise ValueError(f'{destination}: summary {key} differs')
-    initialization_key = 'huang_initialization' if expected['text_temporal_pool'] in HUANG_ALL_MODES else 'head_ablation_initialization'
+    initialization_key = 'experiment_initialization' if expected['text_temporal_pool'] == 'group_gate_experiment' else 'huang_initialization' if expected['text_temporal_pool'] in HUANG_ALL_MODES else 'head_ablation_initialization'
     for key in ('window_evidence', 'source_data_evidence', 'common_initialization', initialization_key,
                 'initial_prediction_evidence', 'temporal_initialization_sha256', 'split_policy', 'temporal_pool_structure'):
         if key not in args or key not in summary or key not in checkpoint or args[key] != summary[key] or args[key] != checkpoint[key]:
@@ -93,6 +94,10 @@ def validate_completed(destination, expected):
         for source in (args, summary, checkpoint, args['text_model_config']):
             if huang_options(source) != huang_options(expected):
                 raise ValueError(f'{destination}: Huang parameters differ')
+    if expected['text_temporal_pool'] == 'group_gate_experiment':
+        for key in ('text_family', 'family_hidden_size', 'text_window', 'group_weight_condition'):
+            if any(source.get(key) != expected[key] for source in (args, summary, checkpoint, args['text_model_config'])):
+                raise ValueError(f'{destination}: experiment configuration differs: {key}')
     data_file = Path(expected['root_path']) / (expected['ticker'] + '.parquet')
     if args['source_data_evidence'].get('parquet_sha256') != file_hash(data_file):
         raise ValueError(f'{destination}: source Parquet changed')
@@ -175,7 +180,8 @@ def training_command(mode, ticker, seed, epochs, commit, data, output, configura
         command.extend(['--' + key, str(value)])
     configuration = configuration or {}
     if configuration:
-        for key, value in huang_options(configuration).items():
+        values = ({k: configuration[k] for k in ('text_family', 'family_hidden_size', 'text_window', 'group_weight_condition')} if 'text_family' in configuration else huang_options(configuration))
+        for key, value in values.items():
             command.extend(['--' + key, str(value)])
     command.extend(['--root_path', str(data), '--data_path', ticker + '.parquet', '--group_weight_mode', 'fixed_uniform',
                     '--text_temporal_pool', configuration.get('text_temporal_pool', mode), '--used_col_prefixes', ','.join(TEXT_GROUPS),
@@ -188,7 +194,7 @@ def execute_training(command, log_path, code):
         return subprocess.run(command, cwd=code, stdout=handle, stderr=subprocess.STDOUT).returncode
 
 
-def print_timing(markers, modes=ABLATION_MODES):
+def print_timing(markers, modes=ABLATION_MODES, configurations=None):
     times = defaultdict(list)
     for job, marker in markers.items():
         if job[0] == 'full':
@@ -205,6 +211,12 @@ def print_timing(markers, modes=ABLATION_MODES):
             fallback.append(mode)
         remaining += (30 - len(values)) * mean
         print(f'TIMING mode={mode} completed={len(values)}/30 mean_seconds={sum(values)/len(values) if values else "pending"}', flush=True)
+    if configurations and all('text_family' in c for c in configurations.values()):
+        for family in sorted({c['text_family'] for c in configurations.values()}):
+            labels = [label for label,c in configurations.items() if c['text_family'] == family]
+            observed_f = [v for label in labels for v in times[label]]
+            remaining_f = sum((30-len(times[label]))*(sum(times[label])/len(times[label]) if times[label] else overall) for label in labels)
+            print(f'FAMILY_TIMING family={family} completed={len(observed_f)}/{30*len(labels)} mean_seconds={sum(observed_f)/len(observed_f) if observed_f else "pending"} ETA_seconds={remaining_f:.1f}', flush=True)
     print(f'ETA remaining_runs={30*len(modes)-len(observed)} estimated_seconds={remaining:.1f} estimated_hours={remaining/3600:.2f} '
           f'overall_mean_fallback_modes={",".join(fallback)}', flush=True)
 
@@ -240,7 +252,7 @@ def run_queue(code, data=DATA, results=RESULTS, commit=None, *, modes=ABLATION_M
         if destination.exists():
             markers[job] = completion(destination, expected_config(mode, ticker, seed, epochs, commit, data, **options(mode)))
     completed = sum(job[0] == 'full' for job in markers)
-    print_timing(markers, modes)
+    print_timing(markers, modes, configurations)
     for job in planned:
         stage, mode, ticker, seed, epochs = job
         destination = results / stage / mode / ticker / f'seed{seed}'
@@ -260,7 +272,7 @@ def run_queue(code, data=DATA, results=RESULTS, commit=None, *, modes=ABLATION_M
         if stage == 'full':
             completed += 1
         print(f'OK stage={stage} mode={mode} ticker={ticker} seed={seed} completed={completed}/{total}', flush=True)
-        print_timing(markers, modes)
+        print_timing(markers, modes, configurations)
     if completed != total:
         raise ValueError(f'Unexpected completed count: {completed}/{total}')
     print(f'ALL {total} RUNS COMPLETED', flush=True)

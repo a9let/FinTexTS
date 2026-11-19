@@ -1,5 +1,17 @@
 # FinTexTS
 
+## Ценовые веса групп против фиксированных 1/5: 720 запусков
+
+Эксперимент `experiment/group-gate-ablation-720`: HAN, Huang replace и Baytas
+T-LSTM, H=16/32, окно/шаги=5/20, price_only/uniform. Точные источники переноса,
+формулы, ограничения сравнений, контролируемые дозапуски last и команды astra:
+**[GROUP_GATE_720.md](GROUP_GATE_720.md)**.
+
+HAN-модули перенесены дословно из `6a62808` (HAN-window), Huang replace сохранён
+из `e642a6d`; полные SHA и хэши файлов — `experiment_group_gate_sources.json`.
+24 NVDA smoke checks выполняются отдельно перед 720 основными задачами.
+Обучение и push при подготовке кода не запускаются.
+
 This repository contains code for forecasting with financial text and time-series data. It is organized into two parts: **data generation** and **forecasting experiments**.
 
 ## Structure
