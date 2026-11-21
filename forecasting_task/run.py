@@ -72,10 +72,15 @@ def parse_args(argv=None):
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
     parser.add_argument("--group_gate", choices=["static", "context_novelty", "context_no_novelty", "context_price_only"], default=None,
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
-    parser.add_argument("--text_family", choices=["han", "huang", "tlstm", "last"], default=None)
-    parser.add_argument("--family_hidden_size", type=int, choices=[16, 32], default=32)
+    parser.add_argument("--text_family", choices=["han", "huang", "tlstm", "last", "memto_group", "titans_linear_group", "xtime_group"], default=None)
+    parser.add_argument("--family_hidden_size", type=int, choices=[8, 16, 32], default=32)
     parser.add_argument("--text_window", type=int, choices=[5, 20], default=20)
     parser.add_argument("--group_weight_condition", choices=["price_only", "uniform"], default="price_only")
+    parser.add_argument("--kd_beta", type=float, choices=[0., .5], default=0.)
+    parser.add_argument("--memory_cache", default=None)
+    parser.add_argument("--memory_progress", default=None)
+    parser.add_argument("--memory_stage", choices=["final", "normal"], default="final")
+    parser.add_argument("--memory_smoke", action="store_true")
     parser.add_argument("--code_commit", default=os.environ.get("CODE_COMMIT"))
     parser.add_argument("--huang_hidden_size", type=int, default=32)
     parser.add_argument("--huang_recurrent_steps", type=int, default=20)
@@ -115,6 +120,16 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.text_family in ("memto_group", "xtime_group") and not args.memory_cache:
+        parser.error("--memory_cache is required for phased experiments")
+    if args.memory_progress and args.text_family not in ("memto_group", "titans_linear_group", "xtime_group"):
+        parser.error("--memory_progress is reserved for memory families")
+    if args.memory_stage == "normal" and (args.text_family != "xtime_group" or args.kd_beta):
+        parser.error("The normal phase is shared by xTime beta values and runs with beta=0")
+    if args.kd_beta and args.text_family != "xtime_group":
+        parser.error("--kd_beta requires xtime_group")
+    if args.text_family == "xtime_group" and args.memory_stage == "final" and args.num_epoch != 1:
+        parser.error("Use --num_epoch 1 for xTime final evaluation after its staged training")
     if args.text_family is not None:
         if args.text_temporal_pool not in ('last', 'group_gate_experiment') or args.group_gate not in (None, 'context_price_only'):
             parser.error('--text_family cannot override an existing architecture or gate condition')
@@ -201,7 +216,9 @@ def parse_args(argv=None):
                 from forecasting_task.models.GroupGateExperiment import experiment_structure
                 parameters = dict(text_family=args.text_family, family_hidden_size=args.family_hidden_size,
                                   text_window=args.text_window, group_weight_condition=args.group_weight_condition)
-                args.temporal_pool_structure = experiment_structure(args.text_family, args.family_hidden_size, args.text_window, args.group_weight_condition, args.pred_len)
+                args.temporal_pool_structure = experiment_structure(args.text_family, args.family_hidden_size, args.text_window, args.group_weight_condition, args.pred_len, args.kd_beta)
+                if args.text_family in ("memto_group", "titans_linear_group", "xtime_group"):
+                    parameters["kd_beta"] = args.kd_beta
                 if args.group_weight_condition == "uniform":
                     args.gate_structure = None
             else:
@@ -448,6 +465,18 @@ def main(argv=None):
                 "encoder_sha256": args.temporal_initialization_sha256}
             args.initial_prediction_evidence = (initial_prediction_evidence(model, text_model, val_dataset, args, device, _prepare_batch)
                                                 if args.text_temporal_pool in ("last_matched", "last_han_h32_residual") else None)
+    staged_order = None
+    if args.text_family == "memto_group":
+        from forecasting_task.memory_phases import prepare_memto
+        args.memory_phases = prepare_memto(text_model, train_dataset, args, device)
+        args.experiment_initialization = state_fingerprint(text_model.core, exclude_prefixes=("gate.",))
+    if args.text_family == "xtime_group":
+        from forecasting_task.memory_phases import prepare_xtime, train_classes
+        if args.memory_stage == "final":
+            args.memory_phases, staged_order = prepare_xtime(model,text_model,train_dataset,args,device,_prepare_batch)
+        else:
+            _, thresholds = train_classes(train_dataset)
+            args.memory_phases = {"thresholds":thresholds}
     args.initial_text_alpha = text_model.get_alpha().detach().cpu().item()
     if args.group_weight_mode == "learnable":
         # Capture the effective softmax values before the optimizer can update G.
@@ -475,20 +504,49 @@ def main(argv=None):
     history = []
     best_epoch = None
     history_path = os.path.join(args.logdir, "history.jsonl")
+    first_epoch = 1
+    best_io = None
+    best_checkpoint = None
+    resume_path = Path(args.memory_progress)/'supervised.pt' if args.memory_progress and staged_order is None else None
+    if resume_path is not None:
+        from forecasting_task.memory_phases import read_phase, save_phase
+        signature = {key:value for key,value in vars(args).items() if key not in ('logdir','memory_phases')}
+        saved = read_phase(resume_path,signature,'cpu')
+        if saved:
+            model.load_state_dict(saved['model'])
+            text_model.load_state_dict(saved['text'])
+            optimizer.load_state_dict(saved['optimizer'])
+            train_generator.set_state(saved['generator'])
+            torch.set_rng_state(saved['rng'])
+            if device.type == 'cuda':
+                torch.cuda.set_rng_state(saved['cuda_rng'],device)
+            history, patience_counter = saved['history'], saved['patience']
+            first_epoch = len(history)+1
+            best_checkpoint, best_io = saved['best'], saved['best_io']
+            best_checkpoint['args'] = vars(args).copy()
+            best_epoch = best_checkpoint['epoch']
+            best_record = best_checkpoint['metrics']
+            best_val, best_test_mse, best_test_mae = (best_record[k] for k in ('val_mse','test_mse','test_mae'))
+            best_text_alpha = best_record['text_alpha']
+            best_test_inputs,best_test_outputs,best_test_gts,best_test_inputs_inv,best_test_outputs_inv,best_test_gts_inv = best_io
+            with open(history_path,'x',encoding='utf-8') as handle:
+                handle.writelines(json.dumps(record,allow_nan=False)+'\n' for record in history)
+            torch.save(best_checkpoint,Path(args.logdir)/'best_checkpoint.pt')
 
-    for epoch in range(1, args.num_epoch + 1):
+    for epoch in range(first_epoch, args.num_epoch + 1):
+        if first_epoch > 1 and patience_counter >= args.patience:
+            break
         synchronize_device(device)
         started = time.perf_counter()
 
-        train_mse, train_mae = _run_epoch(
-            train_dataloader,
-            train_dataset,
-            model,
-            text_model,
-            args,
-            device,
-            optimizer=optimizer,
-        )
+        if staged_order is None:
+            train_mse, train_mae = _run_epoch(
+                train_dataloader, train_dataset, model, text_model, args, device, optimizer=optimizer,
+            )
+        else:
+            train_dataloader.fintexts_batch_order = staged_order
+            with torch.no_grad():
+                train_mse, train_mae = _run_epoch(train_dataloader, train_dataset, model, text_model, args, device)
 
         synchronize_device(device)
         train_seconds = time.perf_counter() - started
@@ -567,7 +625,8 @@ def main(argv=None):
         #     f"test_mae={test_mae:.6f}"
         # )
 
-        if val_mse < best_val:
+        improved = val_mse < best_val
+        if improved:
             best_val = val_mse
             best_text_alpha = record["text_alpha"]
             if args.group_weight_mode == "learnable":
@@ -636,11 +695,23 @@ def main(argv=None):
                 if test_gts is not None
                 else None
             )
+            if resume_path is not None:
+                best_checkpoint = torch.load(checkpoint_path,map_location='cpu',weights_only=True)
+                best_io = (best_test_inputs,best_test_outputs,best_test_gts,best_test_inputs_inv,best_test_outputs_inv,best_test_gts_inv)
+                best_io = tuple(torch.as_tensor(item) for item in best_io)
         else:
             patience_counter += 1
-            if patience_counter >= args.patience:
-                print(f"Early stopping at epoch {epoch} (best val_mse={best_val:.6f})")
-                break
+        if resume_path is not None:
+            save_phase(resume_path, dict(signature=signature, model=model.state_dict(),text=text_model.state_dict(),
+                        optimizer=optimizer.state_dict(), generator=train_generator.get_state(),rng=torch.get_rng_state(),
+                        cuda_rng=torch.cuda.get_rng_state(device) if device.type=='cuda' else None,
+                        history=history,patience=patience_counter,best=best_checkpoint,best_io=best_io))
+            elapsed = sum(r["train_seconds"]+r["val_seconds"]+r["test_seconds"] for r in history)
+            print(f"PHASE {args.memory_stage}/supervised epoch={epoch}/{args.num_epoch} "
+                  f"seconds={elapsed:.2f} ETA_seconds={elapsed/epoch*(args.num_epoch-epoch):.2f}",flush=True)
+        if not improved and patience_counter >= args.patience:
+            print(f"Early stopping at epoch {epoch} (best val_mse={best_val:.6f})")
+            break
 
     print(
         f"[Best] val_mse={best_val:.6f} test_mse={best_test_mse:.6f} test_mae={best_test_mae:.6f}"
@@ -744,6 +815,8 @@ def main(argv=None):
             summary.update(huang_initialization=args.huang_initialization,
                            initial_prediction_evidence=args.initial_prediction_evidence,
                            **huang_options(vars(args)))
+    if hasattr(args, "memory_phases"):
+        summary["memory_phases"] = args.memory_phases
     if args.model_type.lower() == "patchtst":
         summary["actual_patch_len"] = model.patch_embedding.patch_len
         summary["actual_stride"] = model.patch_embedding.stride
@@ -759,4 +832,11 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as error:
+        from forecasting_task.memory_phases import InsufficientTrainData
+        if not isinstance(error, InsufficientTrainData):
+            raise
+        print(f"TRAIN_DATA_INSUFFICIENT: {error}", flush=True)
+        raise SystemExit(42) from error

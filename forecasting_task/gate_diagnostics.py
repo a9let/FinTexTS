@@ -34,7 +34,7 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
             output, detail = text_model(film_output, x[:, -1], text[:, -1],
                                         price_window=x, return_details=True, **metadata)
             group_records = {}
-            if getattr(args, 'text_family', None) in ('tlstm', 'last'):
+            if getattr(args, 'text_family', None) in ('tlstm', 'last', 'memto_group', 'titans_linear_group', 'xtime_group'):
                 from forecasting_task.group_gate_diagnostics import records
                 group_records, date_records, component_records = records(dataset, batch[5].tolist(), film_output,
                     x[:, -1], output, detail, text_model.get_alpha(), args.text_family)

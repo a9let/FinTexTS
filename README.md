@@ -1,5 +1,8 @@
 # FinTexTS
 
+The optional 720-run MEMTO, linear Titans and xTime experiments are
+documented in [MEMORY_ABLATION.md](MEMORY_ABLATION.md).
+
 ## Ценовые веса групп против фиксированных 1/5: 720 запусков
 
 Эксперимент `experiment/group-gate-ablation-720`: HAN, Huang replace и Baytas

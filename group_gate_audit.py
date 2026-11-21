@@ -13,7 +13,7 @@ EPOCH_LIMIT = 50
 
 def configuration_issues(run, summary, args, checkpoint):
     missing, mismatch = [], []
-    expected = {**queue.SETTINGS, 'num_epoch': EPOCH_LIMIT, 'used_col_prefixes': list(TEXT_GROUPS), 'group_weight_mode': 'context_price_only'}
+    expected = {**queue.SETTINGS, 'num_epoch': 1 if args.get('text_family') == 'xtime_group' and args.get('memory_stage') == 'final' else EPOCH_LIMIT, 'used_col_prefixes': list(TEXT_GROUPS), 'group_weight_mode': 'context_price_only'}
     for key, value in expected.items():
         if key not in args:
             missing.append(key)
@@ -23,7 +23,7 @@ def configuration_issues(run, summary, args, checkpoint):
         mismatch.append('ticker/seed')
     keys = ('text_family','family_hidden_size','text_window','group_weight_condition')
     try:
-        structure = experiment_structure(*(args[k] for k in keys), args['pred_len'])
+        structure = experiment_structure(*(args[k] for k in keys), args['pred_len'], args.get('kd_beta',0.))
     except (KeyError,ValueError) as error:
         return missing, mismatch+[str(error)]
     for name, source in (('args',args),('summary',summary),('checkpoint',checkpoint),('model_config',args.get('text_model_config',{}))):
@@ -97,7 +97,7 @@ def provenance(output, metadata):
     return {'initialization':initial,'source':source,'orders':orders,'encoder':args.get('experiment_initialization')}, missing
 
 
-def compare(left, right, gate_pair=False):
+def compare(left, right, gate_pair=False, *, allow_cross_commit=False):
     import analyze_context_price_group_gru_attention as prior
     a,b = left[1],right[1]
     if a['evidence'] != b['evidence'] or a['split'] != b['split']:
@@ -120,7 +120,8 @@ def compare(left, right, gate_pair=False):
         raise ValueError('Actual train batch order differs')
     if gate_pair and left[3]['encoder'] != right[3]['encoder']:
         raise ValueError('Paired common text initialization differs')
-    if a['args'].get('text_temporal_pool') == MODE and b['args'].get('text_temporal_pool') == MODE and a['args'].get('code_commit') != b['args'].get('code_commit'):
+    if (not allow_cross_commit and a['args'].get('text_temporal_pool') == MODE and b['args'].get('text_temporal_pool') == MODE
+            and a['args'].get('code_commit') != b['args'].get('code_commit')):
         raise ValueError('New experiment code commits differ')
     return epochs
 

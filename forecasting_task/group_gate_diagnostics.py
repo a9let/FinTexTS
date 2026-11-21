@@ -10,16 +10,23 @@ def records(dataset, indices, film, last, output, detail, alpha, family):
     a = {k: v.detach().cpu().numpy() for k, v in detail.items()}
     parts = [x.detach().cpu().numpy() for x in (film_part, anchor, text, output, film_part+anchor+text)]
     groups, dates, components = {}, [], []
-    window = a['tlstm_present'].shape[1] if family == 'tlstm' else 1
+    window = a['tlstm_present'].shape[1] if family == 'tlstm' else a['memory_present'].shape[1] if 'memory_present' in a else 1
     for sample, index in enumerate(indices):
         end = index + dataset.seq_len
         for g, group in enumerate(TEXT_GROUPS):
             groups[index, group] = {'date_decomposition': False, 'text_family': family}
+            if 'expert_weights' in a:
+                groups[index, group].update({f'expert_weight_{name}': float(weight)
+                    for name, weight in zip(('normal','moderate','extreme'),a['expert_weights'][sample])})
             for row, date in enumerate(dataset.row_dates[end-window:end]):
                 item = {'window_index': index, 'input_end_date': dataset.window_end_date(index), 'group': group,
                         'date': str(date), 'present': int(a['tlstm_present'][sample,row,g] if family == 'tlstm' else a['present'][sample,g])}
                 if family == 'tlstm':
                     item.update(delta_days=float(a['tlstm_delta'][sample,row,g]), decay=float(a['tlstm_decay'][sample,row,g]))
+                if 'memory_present' in a:
+                    names = ('lsd','isd','anomaly') if family == 'memto_group' else ('gradient_norm','alpha','eta','theta')
+                    item['present'] = int(a['memory_present'][sample,row,g])
+                    item.update({name:float(v) for name,v in zip(names,a['memory_date_values'][sample,row,g])})
                 dates.append(item)
         for h in range(output.shape[1]):
             for c, channel in enumerate(('open','high','low','close')):

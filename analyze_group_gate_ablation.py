@@ -20,7 +20,7 @@ BASE_METRICS = ('val_mse','test_mse','test_mae')
 METRICS = (*BASE_METRICS, *(f'{m}_h{h}' for m in BASE_METRICS for h in (1,2,3)))
 
 
-def inspect(label, ticker, seed, output, cache, historical=False):
+def inspect(label, ticker, seed, output, cache, historical=False, configurations=CONFIGURATIONS):
     variant = 'original_baseline' if historical else MODE
     try:
         result = prior.inspect_run(Run(variant,ticker,seed,output), cache)
@@ -34,7 +34,7 @@ def inspect(label, ticker, seed, output, cache, historical=False):
     if metadata:
         args = metadata['args']
         try:
-            expected = (CONTROLS if label.startswith('last_') else CONFIGURATIONS)[label]
+            expected = (CONTROLS if label.startswith('last_') else configurations)[label]
             if historical:
                 gate='static' if expected['group_weight_condition']=='uniform' else 'context_price_only'
                 if args.get('group_gate') != gate or args.get('fixed_alpha') != .1 or args.get('fusion_mode') != 'blend' or args.get('text_num_layers') != 1:
@@ -73,11 +73,11 @@ def inspect(label, ticker, seed, output, cache, historical=False):
     return row,metadata,payload,proof,contributions
 
 
-def pair(left,right,gate_pair=False):
+def pair(left,right,gate_pair=False,*,allow_cross_commit=False):
     status,reason='partial','incomplete evidence'
     if left[0]['comparable'] and right[0]['comparable']:
         try:
-            audit.compare(left,right,gate_pair)
+            audit.compare(left,right,gate_pair,allow_cross_commit=allow_cross_commit)
             status,reason='full',''
         except KeyError as error:
             reason=str(error)

@@ -55,7 +55,7 @@ def expected_config(mode, ticker, seed, epochs, commit, data, configuration=None
     parameters = huang_options(settings) if actual_mode in HUANG_ALL_MODES else {}
     return {**settings, 'text_temporal_pool': actual_mode, 'ticker': ticker, 'seed': seed, 'num_epoch': epochs,
             'code_commit': commit, 'root_path': str(Path(data).resolve()),
-            'used_col_prefixes': list(TEXT_GROUPS), 'structure': (experiment_structure(settings['text_family'], settings['family_hidden_size'], settings['text_window'], settings['group_weight_condition'], settings['pred_len']) if actual_mode == 'group_gate_experiment' else temporal_structure(actual_mode, settings['pred_len'], **parameters))}
+            'used_col_prefixes': list(TEXT_GROUPS), 'structure': (experiment_structure(settings['text_family'], settings['family_hidden_size'], settings['text_window'], settings['group_weight_condition'], settings['pred_len'], settings.get('kd_beta',0.)) if actual_mode == 'group_gate_experiment' else temporal_structure(actual_mode, settings['pred_len'], **parameters))}
 
 
 def validate_completed(destination, expected):
@@ -98,6 +98,9 @@ def validate_completed(destination, expected):
         for key in ('text_family', 'family_hidden_size', 'text_window', 'group_weight_condition'):
             if any(source.get(key) != expected[key] for source in (args, summary, checkpoint, args['text_model_config'])):
                 raise ValueError(f'{destination}: experiment configuration differs: {key}')
+        for key in ('kd_beta', 'memory_stage', 'memory_smoke'):
+            if key in expected and args.get(key) != expected[key]:
+                raise ValueError(f'{destination}: phase configuration differs: {key}')
     data_file = Path(expected['root_path']) / (expected['ticker'] + '.parquet')
     if args['source_data_evidence'].get('parquet_sha256') != file_hash(data_file):
         raise ValueError(f'{destination}: source Parquet changed')
