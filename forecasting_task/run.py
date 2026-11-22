@@ -128,8 +128,8 @@ def parse_args(argv=None):
             args.price_gate_lags = list(validate_price_lags([int(lag) for lag in supplied.split(",")], args.seq_len))
         except ValueError as error:
             parser.error(f"Invalid --price_gate_lags: {error}")
-        if not 1 <= args.text_window <= args.seq_len:
-            parser.error("--text_window must be positive and at most seq_len")
+        if not (1 <= args.text_window <= args.seq_len or (args.seq_len, args.text_window) == (64, 80)):
+            parser.error("--text_window must fit seq_len, or use 80 text rows with seq_len=64")
         if args.group_weight_condition != "price_only" or args.family_hidden_size != 32:
             parser.error("mean_price_grid uses price_only and the default family_hidden_size")
     else:
@@ -153,7 +153,8 @@ def parse_args(argv=None):
             parser.error('last controls use the default placeholders H=32/window=20 and read only the last row')
         args.text_temporal_pool = "group_gate_experiment"
         args.group_gate = "context_price_only"
-        if args.seq_len < (args.text_window + (10 if args.text_family == "huang" else 0)):
+        if (args.text_family != "mean_price_grid"
+                and args.seq_len < args.text_window + (10 if args.text_family == "huang" else 0)):
             parser.error("Text history exceeds the price input window")
     elif args.group_weight_condition != 'price_only' or args.family_hidden_size != 32 or args.text_window != 20:
         parser.error('Family parameters require --text_family')
@@ -316,6 +317,9 @@ def _run_epoch(
     dataloader, dataset, model, text_model, args, device, optimizer=None, collect_io=False
 ):
     is_train = optimizer is not None
+    group_gate = getattr(args, "group_gate", None)
+    if group_gate:
+        from forecasting_task.data_provider.context_novelty import gate_batch_inputs
     if is_train:
         model.train()
         text_model.train()
@@ -329,7 +333,7 @@ def _run_epoch(
     input_chunks = []
     output_chunks = []
     gt_chunks = []
-    batch_audit = hashlib.sha256() if is_train and getattr(args, "group_gate", None) == "context_price_only" else None
+    batch_audit = hashlib.sha256() if is_train and group_gate == "context_price_only" else None
     audit_windows, audit_batches = 0, 0
 
     for batch in dataloader:
@@ -347,10 +351,9 @@ def _run_epoch(
             optimizer.zero_grad()
 
         output = model(seq_price_x, seq_x_mark, dec_inp, seq_y_mark)
-        if getattr(args, "group_gate", None):
-            metadata = {key: value.float().to(device) for key, value in batch[6].items()}
-            if getattr(args, "text_temporal_pool", "last") != "last":
-                metadata["text_window"] = seq_text_x
+        if group_gate:
+            metadata = gate_batch_inputs(batch[6], seq_text_x, device,
+                                         use_window=getattr(args, "text_temporal_pool", "last") != "last")
             output = text_model(output, seq_price_x[:, -1], seq_text_x[:, -1], price_window=seq_price_x, **metadata)
         else:
             output = text_model(output, seq_price_x[:, -1, :], seq_text_x[:, -1, :, :])
@@ -398,6 +401,8 @@ def main(argv=None):
         if args.text_family is not None:
             from functools import partial
             loader_factory = partial(loader_factory, include_calendar_days=True)
+            if args.text_family == "mean_price_grid" and args.text_window > args.seq_len:
+                loader_factory = partial(loader_factory, extended_text_window=args.text_window)
     train_dataset, train_dataloader = loader_factory(
         seq_len=args.seq_len,
         label_len=args.label_len,
@@ -433,6 +438,11 @@ def main(argv=None):
         from forecasting_task.window_evidence import window_evidence, SPLIT_POLICY
         args.split_policy = SPLIT_POLICY.copy()
         args.window_evidence = {"val": window_evidence(val_dataset), "test": window_evidence(test_dataset)}
+        if args.text_family == "mean_price_grid" and args.text_window > args.seq_len:
+            args.extended_text_evidence = {
+                split: dataset.extended_text_evidence()
+                for split, dataset in (("train", train_dataset), ("val", val_dataset), ("test", test_dataset))
+            }
     if args.model_type.lower() == "dlinear":
         model = DLinear(args)
     elif args.model_type.lower() == "patchtst":
@@ -689,6 +699,8 @@ def main(argv=None):
                                           text_window=args.text_window, group_weight_condition=args.group_weight_condition)
                         if args.text_family == "mean_price_grid":
                             checkpoint["price_gate_lags"] = args.price_gate_lags
+                            if hasattr(args, "extended_text_evidence"):
+                                checkpoint["extended_text_evidence"] = args.extended_text_evidence
                     if hasattr(args, "head_ablation_initialization"):
                         checkpoint.update(head_ablation_initialization=args.head_ablation_initialization,
                                           initial_prediction_evidence=args.initial_prediction_evidence)
@@ -838,6 +850,8 @@ def main(argv=None):
                            group_weight_condition=args.group_weight_condition)
             if args.text_family == "mean_price_grid":
                 summary["price_gate_lags"] = args.price_gate_lags
+                if hasattr(args, "extended_text_evidence"):
+                    summary["extended_text_evidence"] = args.extended_text_evidence
         if hasattr(args, "head_ablation_initialization"):
             summary.update(head_ablation_initialization=args.head_ablation_initialization,
                            initial_prediction_evidence=args.initial_prediction_evidence)

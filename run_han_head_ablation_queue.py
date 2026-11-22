@@ -111,6 +111,13 @@ def validate_completed(destination, expected):
         for key in ('kd_beta', 'memory_stage', 'memory_smoke'):
             if key in expected and args.get(key) != expected[key]:
                 raise ValueError(f'{destination}: phase configuration differs: {key}')
+        if expected['text_family'] == 'mean_price_grid' and expected['text_window'] > expected['seq_len']:
+            evidence = args.get('extended_text_evidence')
+            if (not evidence or set(evidence) != {'train', 'val', 'test'}
+                    or summary.get('extended_text_evidence') != evidence
+                    or checkpoint.get('extended_text_evidence') != evidence
+                    or any(split['requested_rows'] != expected['text_window'] for split in evidence.values())):
+                raise ValueError(f'{destination}: extended text window evidence differs')
     data_file = Path(expected['root_path']) / (expected['ticker'] + '.parquet')
     if args['source_data_evidence'].get('parquet_sha256') != file_hash(data_file):
         raise ValueError(f'{destination}: source Parquet changed')

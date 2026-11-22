@@ -15,12 +15,16 @@ def records(dataset, indices, film, last, output, detail, alpha, family):
         window = a['mean_present'].shape[1]
     for sample, index in enumerate(indices):
         end = index + dataset.seq_len
+        extended = family == 'mean_price_grid' and window > dataset.seq_len
+        window_dates = dataset.text_window_dates(index) if extended else dataset.row_dates[end-window:end]
         for g, group in enumerate(TEXT_GROUPS):
             groups[index, group] = {'date_decomposition': False, 'text_family': family}
+            if extended:
+                groups[index, group]['text_window_length'] = len(window_dates)
             if 'expert_weights' in a:
                 groups[index, group].update({f'expert_weight_{name}': float(weight)
                     for name, weight in zip(('normal','moderate','extreme'),a['expert_weights'][sample])})
-            for row, date in enumerate(dataset.row_dates[end-window:end]):
+            for row, date in enumerate(window_dates, start=window-len(window_dates)):
                 item = {'window_index': index, 'input_end_date': dataset.window_end_date(index), 'group': group,
                         'date': str(date), 'present': int(a['tlstm_present'][sample,row,g] if family == 'tlstm' else a['present'][sample,g])}
                 if family == 'tlstm':

@@ -33,14 +33,17 @@ class ReplayCache:
         self.datasets = {}
 
     def get(self, ticker, args):
-        key = (ticker, args['seq_len'], args['label_len'], args['pred_len'], tuple(args['used_col_prefixes']))
+        extended = (args['text_window'] if args.get('text_family') == 'mean_price_grid'
+                    and args['text_window'] > args['seq_len'] else None)
+        key = (ticker, args['seq_len'], args['label_len'], args['pred_len'], tuple(args['used_col_prefixes']), extended)
         if key not in self.datasets:
             tickers = pd.read_parquet(self.data_root / (ticker + '.parquet'), columns=['ticker'])['ticker']
             if tickers.isna().any() or set(tickers) != {ticker}:
                 raise ValueError(f'Data file contains a different ticker: {ticker}')
             self.datasets[key] = {flag: ContextNoveltyDataset(Dataset_Custom(
                 args['seq_len'], args['label_len'], args['pred_len'], flag, args['used_col_prefixes'],
-                root_path=str(self.data_root), data_path=ticker + '.parquet')) for flag in ('train', 'val', 'test')}
+                root_path=str(self.data_root), data_path=ticker + '.parquet'),
+                extended_text_window=extended) for flag in ('train', 'val', 'test')}
         return self.datasets[key]
 
 

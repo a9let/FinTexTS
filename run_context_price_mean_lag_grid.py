@@ -18,11 +18,10 @@ from run_group_memory_queue import execute, queue_lock
 
 SCRIPTS = ('run_context_price_mean_lag_grid.sh', 'run_context_price_mean_lag_grid.py',
            'mean_lag_grid_audit.py', 'run_group_memory_queue.py', 'run_han_head_ablation_queue.py')
-TOTAL = len(audit.CONFIGS) * len(audit.PAIRS)
 
 
-def jobs():
-    return shared.jobs(tuple(audit.CONFIGS))
+def jobs(configurations=audit.CONFIGS):
+    return shared.jobs(tuple(configurations))
 
 
 def record_json(path, value):
@@ -50,10 +49,12 @@ def select_control(results, normal_root, data, force):
     return decision
 
 
-def run_queue(code, data, results, normal_root, force=False):
+def run_queue(code, data, results, normal_root, force=False, *, configurations=audit.CONFIGS, scripts=SCRIPTS):
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA is unavailable')
-    code, data, results, normal_root = (Path(p).resolve() for p in (code, data, results, normal_root))
+    code, data, results = (Path(p).resolve() for p in (code, data, results))
+    if normal_root is not None:
+        normal_root = Path(normal_root).resolve()
     commit = os.environ.get('CODE_COMMIT') or subprocess.check_output(
         ['git', '-C', str(code), 'rev-parse', 'HEAD'], text=True).strip()
     if not re.fullmatch(r'[a-fA-F0-9]{40}|[a-fA-F0-9]{64}', commit):
@@ -64,40 +65,45 @@ def run_queue(code, data, results, normal_root, force=False):
     results.mkdir(parents=True, exist_ok=True)
     with queue_lock(results / '.queue.lock'):
         shared.record_file(results / 'code_commit.txt', (commit+'\n').encode())
-        for script in SCRIPTS:
+        for script in scripts:
             shared.record_file(results / script, (code / script).read_bytes())
-        record_json(results / 'manifest.json', dict(code_commit=commit, data=str(data), normal_root=str(normal_root),
-                    settings=shared.SETTINGS, configurations=audit.CONFIGS, jobs=jobs()))
-        for area, cell, ticker, seed, epochs in jobs():
+        inventory = jobs(configurations)
+        record_json(results / 'manifest.json', dict(code_commit=commit, data=str(data),
+                    normal_root=str(normal_root) if normal_root is not None else None,
+                    settings=shared.SETTINGS, configurations=configurations, jobs=inventory))
+        for area, cell, ticker, seed, epochs in inventory:
             if area != 'checks':
                 break
             destination = audit.grid_destination(results, cell, ticker, seed, area)
-            execute(code, data, commit, destination, audit.CONFIGS[cell], ticker, seed, epochs, [], None)
+            execute(code, data, commit, destination, configurations[cell], ticker, seed, epochs, [], None)
             print(f'OK check={cell}', flush=True)
 
-        decision = select_control(results, normal_root, data, force)
-        reused = len(audit.PAIRS) if decision['source'] == 'historical' else 0
-        print(f'CONTROL {decision["source"]}: {decision["reason"]}', flush=True)
-        for record in decision['records']:
-            if record['status'] == 'rejected':
-                print(f'CONTROL_REJECT {record["ticker"]}/seed{record["seed"]}: {record["reason"]}', flush=True)
-        planned = [(cell, ticker, seed, epochs) for area, cell, ticker, seed, epochs in jobs()
+        reused = 0
+        if normal_root is not None:
+            decision = select_control(results, normal_root, data, force)
+            reused = len(audit.PAIRS) if decision['source'] == 'historical' else 0
+            print(f'CONTROL {decision["source"]}: {decision["reason"]}', flush=True)
+            for record in decision['records']:
+                if record['status'] == 'rejected':
+                    print(f'CONTROL_REJECT {record["ticker"]}/seed{record["seed"]}: {record["reason"]}', flush=True)
+        planned = [(cell, ticker, seed, epochs) for area, cell, ticker, seed, epochs in inventory
                    if area == 'full' and (not reused or cell != audit.CONTROL)]
         remaining = len(planned)
-        print(f'GRID trained=0 reused={reused} remaining={remaining} total={TOTAL}', flush=True)
+        total = remaining + reused
+        print(f'GRID trained=0 reused={reused} remaining={remaining} total={total}', flush=True)
         timing = defaultdict(list)
         for trained, (cell, ticker, seed, epochs) in enumerate(planned, 1):
             destination = audit.grid_destination(results, cell, ticker, seed)
-            marker = execute(code, data, commit, destination, audit.CONFIGS[cell], ticker, seed, epochs, [], None)
+            marker = execute(code, data, commit, destination, configurations[cell], ticker, seed, epochs, [], None)
             timing[cell].append(marker['wall_seconds'])
             remaining = len(planned) - trained
             overall = mean(seconds for values in timing.values() for seconds in values)
             eta = sum(mean(timing[label]) if label in timing else overall
                       for label, *_ in planned[trained:])
             print(f'OK {cell}/{ticker}/seed{seed} trained={trained} reused={reused} remaining={remaining} '
-                  f'completed={trained+reused}/{TOTAL} cell_mean_seconds={mean(timing[cell]):.1f} '
+                  f'completed={trained+reused}/{total} cell_mean_seconds={mean(timing[cell]):.1f} '
                   f'eta_seconds={eta:.1f}', flush=True)
-        print(f'ALL {TOTAL} GRID RESULTS COMPLETE trained={len(planned)} reused={reused}', flush=True)
+        print(f'ALL {total} GRID RESULTS COMPLETE trained={len(planned)} reused={reused}', flush=True)
 
 
 def main():

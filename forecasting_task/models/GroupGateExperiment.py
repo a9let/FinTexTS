@@ -116,7 +116,9 @@ class GroupGateExperiment(nn.Module):
         if self.family == 'last':
             return self.core(price_output, last_price, embeddings, **kwargs)
         if self.family == MEAN_GRID:
-            if text_window.shape[:2] != price_window.shape[:2] or text_window.shape[1] < self.window:
+            price_rows = price_window.shape[1]
+            expected_rows = max(price_rows, self.window)
+            if text_window.shape[:2] != (price_window.shape[0], expected_rows):
                 raise ValueError('Mean pooling requires aligned input windows covering W rows')
             text = text_window[:, -self.window:].float()
             present = text.abs().sum(-1) >= 1e-6

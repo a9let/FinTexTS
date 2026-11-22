@@ -1,9 +1,11 @@
 """Opt-in causal features; Dataset_Custom and its temporal/scaling policy stay intact."""
 
+import hashlib
 import os
 
 import numpy as np
 import pandas as pd
+import torch
 from torch.utils.data import Dataset, DataLoader
 
 from forecasting_task.data_provider.dataset import Dataset_Custom
@@ -50,7 +52,7 @@ def causal_novelty(embeddings):
 class ContextNoveltyDataset(Dataset):
     """Append last-input-day novelty/pair features to the original six fields."""
 
-    def __init__(self, base, include_calendar_days=False):
+    def __init__(self, base, include_calendar_days=False, extended_text_window=None):
         if base.seq_len < 6 or tuple(base.used_col_prefixes) != TEXT_GROUPS:
             raise ValueError("group_gate requires seq_len>=6 and all five ordered groups")
         self.base = base
@@ -89,6 +91,14 @@ class ContextNoveltyDataset(Dataset):
         self.row_dates = dates.iloc[start:stop].dt.strftime("%Y-%m-%d").to_numpy()
         self.novelty = novelty[start:stop]
         self.pair_available = pairs[start:stop]
+        self.extended_text_window = extended_text_window
+        if extended_text_window is not None:
+            if extended_text_window <= base.seq_len:
+                raise ValueError("Extended text window must be longer than the price window")
+            source_start = max(0, start + base.seq_len - extended_text_window)
+            self._text_offset = start - source_start
+            self._text_source = embeddings[source_start:stop].copy()
+            self._text_dates = dates.iloc[source_start:stop].dt.strftime("%Y-%m-%d").to_numpy()
 
     def __len__(self):
         return len(self.base)
@@ -98,7 +108,43 @@ class ContextNoveltyDataset(Dataset):
         metadata = {"novelty": self.novelty[row], "pair_available": self.pair_available[row]}
         if self.include_calendar_days:
             metadata['calendar_days'] = self.row_dates[index:index + self.seq_len].astype('datetime64[D]').astype(np.int64)
+        if self.extended_text_window is not None:
+            span = self._text_span(index)
+            # Collate the prefix only; the original six fields already carry the last seq_len rows.
+            history = self._text_source[span.start:span.stop - self.seq_len]
+            missing = self.extended_text_window - self.seq_len - len(history)
+            if missing:
+                history = np.pad(history, ((missing, 0), (0, 0), (0, 0)))
+            metadata['text_history'] = history
         return (*self.base[index], metadata)
+
+    def _text_span(self, index):
+        stop = int(index) + self.seq_len + self._text_offset
+        return slice(max(0, stop - self.extended_text_window), stop)
+
+    def text_window_dates(self, index):
+        """Dates of real source rows, excluding collation padding."""
+        return self._text_dates[self._text_span(index)]
+
+    def extended_text_evidence(self):
+        """Fingerprint the source and the exact causal slice of every text window."""
+        bounds = hashlib.sha256()
+        lengths = []
+        for index in range(len(self)):
+            dates = self.text_window_dates(index)
+            if dates[-1] != self.window_end_date(index):
+                raise ValueError("Text window end does not match the last price date")
+            lengths.append(len(dates))
+            bounds.update(f'{dates[0]}|{dates[-1]}|{len(dates)}\n'.encode())
+        return {
+            'requested_rows': self.extended_text_window,
+            'windows': len(lengths),
+            'min_rows': min(lengths),
+            'max_rows': max(lengths),
+            'source_text_sha256': hashlib.sha256(self._text_source.astype('<f4', copy=False).tobytes()).hexdigest(),
+            'source_dates_sha256': hashlib.sha256('\n'.join(self._text_dates).encode()).hexdigest(),
+            'window_bounds_sha256': bounds.hexdigest(),
+        }
 
     def window_end_date(self, index):
         return str(self.row_dates[int(index) + self.seq_len - 1])
@@ -107,8 +153,18 @@ class ContextNoveltyDataset(Dataset):
         return self.base.inverse_transform(values)
 
 
+def gate_batch_inputs(metadata, text, device, *, use_window):
+    features = {key: value.float().to(device) for key, value in metadata.items()}
+    history = features.pop('text_history', None)
+    if use_window:
+        features['text_window'] = text if history is None else torch.cat((history, text), dim=1)
+    return features
+
+
 def get_context_novelty_dataloader(batch_size, **kwargs):
     include_days = kwargs.pop('include_calendar_days', False)
-    dataset = ContextNoveltyDataset(Dataset_Custom(**kwargs), include_calendar_days=include_days)
+    extended_text_window = kwargs.pop('extended_text_window', None)
+    dataset = ContextNoveltyDataset(Dataset_Custom(**kwargs), include_calendar_days=include_days,
+                                    extended_text_window=extended_text_window)
     train = kwargs["flag"] == "train"
     return dataset, DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=1, drop_last=train)

@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from forecasting_task.data_provider.context_novelty import gate_batch_inputs
 from forecasting_task.models.GroupText import TEXT_GROUPS
 
 
@@ -27,9 +28,8 @@ def write_gate_validation(loader, dataset, model, text_model, args, device, prep
     with torch.no_grad():
         for batch in loader:
             x, text, x_mark, y_mark, decoder, target = prepare_batch(batch, device, args.pred_len, args.label_len)
-            metadata = {key: value.float().to(device) for key, value in batch[6].items()}
-            if getattr(args, "text_temporal_pool", "last") != "last":
-                metadata["text_window"] = text
+            metadata = gate_batch_inputs(batch[6], text, device,
+                                         use_window=getattr(args, "text_temporal_pool", "last") != "last")
             film_output = model(x, x_mark, decoder, y_mark)
             output, detail = text_model(film_output, x[:, -1], text[:, -1],
                                         price_window=x, return_details=True, **metadata)

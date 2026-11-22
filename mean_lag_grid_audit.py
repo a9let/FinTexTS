@@ -163,6 +163,10 @@ def checked_run(destination, config, data, commit, ticker, seed, cache, *, histo
         raise ValueError('Missing protocol evidence: ' + ', '.join(missing))
     args = metadata['args']
     checkpoint = torch.load(output / 'best_checkpoint.pt', map_location='cpu', weights_only=True)
+    if args.get('extended_text_evidence'):
+        replay = {split: dataset.extended_text_evidence() for split, dataset in metadata['datasets'].items()}
+        if args['extended_text_evidence'] != replay:
+            raise ValueError('Extended text rows, dates or window bounds differ')
     orders, best_state = replay_orders(len(metadata['datasets']['train']), args['batch_size'], seed,
                                       summary['epochs_completed'], summary['best_epoch'])
     if orders != proof['orders'] or not torch.equal(best_state, checkpoint['train_generator_state']):
