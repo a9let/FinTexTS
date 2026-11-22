@@ -53,9 +53,16 @@ def expected_config(mode, ticker, seed, epochs, commit, data, configuration=None
     settings = dict(SETTINGS, **(configuration or {}))
     actual_mode = settings.pop('text_temporal_pool', mode)
     parameters = huang_options(settings) if actual_mode in HUANG_ALL_MODES else {}
+    if actual_mode == 'group_gate_experiment':
+        structure = experiment_structure(settings['text_family'], settings['family_hidden_size'],
+                                         settings['text_window'], settings['group_weight_condition'],
+                                         settings['pred_len'], settings.get('kd_beta', 0.),
+                                         settings.get('price_gate_lags', (1, 5)))
+    else:
+        structure = temporal_structure(actual_mode, settings['pred_len'], **parameters)
     return {**settings, 'text_temporal_pool': actual_mode, 'ticker': ticker, 'seed': seed, 'num_epoch': epochs,
             'code_commit': commit, 'root_path': str(Path(data).resolve()),
-            'used_col_prefixes': list(TEXT_GROUPS), 'structure': (experiment_structure(settings['text_family'], settings['family_hidden_size'], settings['text_window'], settings['group_weight_condition'], settings['pred_len'], settings.get('kd_beta',0.)) if actual_mode == 'group_gate_experiment' else temporal_structure(actual_mode, settings['pred_len'], **parameters))}
+            'used_col_prefixes': list(TEXT_GROUPS), 'structure': structure}
 
 
 def validate_completed(destination, expected):
@@ -95,7 +102,10 @@ def validate_completed(destination, expected):
             if huang_options(source) != huang_options(expected):
                 raise ValueError(f'{destination}: Huang parameters differ')
     if expected['text_temporal_pool'] == 'group_gate_experiment':
-        for key in ('text_family', 'family_hidden_size', 'text_window', 'group_weight_condition'):
+        family_keys = ('text_family', 'family_hidden_size', 'text_window', 'group_weight_condition')
+        if 'price_gate_lags' in expected:
+            family_keys += ('price_gate_lags',)
+        for key in family_keys:
             if any(source.get(key) != expected[key] for source in (args, summary, checkpoint, args['text_model_config'])):
                 raise ValueError(f'{destination}: experiment configuration differs: {key}')
         for key in ('kd_beta', 'memory_stage', 'memory_smoke'):
@@ -109,6 +119,9 @@ def validate_completed(destination, expected):
             or len(history) != summary['epochs_completed'] or len(history) > expected['num_epoch']):
         raise ValueError(f'{destination}: incomplete/inconsistent epoch history')
     best = min(history, key=lambda r: r['val_mse'])
+    if ('price_gate_lags' in expected and len(history) != expected['num_epoch']
+            and len(history) - best['epoch'] != expected['patience']):
+        raise ValueError(f'{destination}: epoch limit/early stopping completion unconfirmed')
     if (summary['best_epoch'] != best['epoch'] or checkpoint['epoch'] != best['epoch']
             or checkpoint['metrics'] != best or summary['best_val_mse'] != best['val_mse']
             or summary['best_test_mse'] != best['test_mse'] or summary['best_test_mae'] != best['test_mae']):
@@ -186,6 +199,8 @@ def training_command(mode, ticker, seed, epochs, commit, data, output, configura
         values = ({k: configuration[k] for k in ('text_family', 'family_hidden_size', 'text_window', 'group_weight_condition')} if 'text_family' in configuration else huang_options(configuration))
         for key, value in values.items():
             command.extend(['--' + key, str(value)])
+        if 'price_gate_lags' in configuration:
+            command.extend(['--price_gate_lags', ','.join(map(str, configuration['price_gate_lags']))])
     command.extend(['--root_path', str(data), '--data_path', ticker + '.parquet', '--group_weight_mode', 'fixed_uniform',
                     '--text_temporal_pool', configuration.get('text_temporal_pool', mode), '--used_col_prefixes', ','.join(TEXT_GROUPS),
                     '--num_epoch', str(epochs), '--seed', str(seed), '--code_commit', commit, '--logdir', str(output)])

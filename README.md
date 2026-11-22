@@ -1601,3 +1601,62 @@ docker exec -e CODE_COMMIT="$CODE_COMMIT" -w "$CONTAINER_CODE" \
       --logdir /auto/datasets/kondyurin/FinTexTS/runs/context_price_huang_replace_single_v1/output
   '
 ```
+
+### Mean price grid
+
+Окна в 10, 20 и 40 торговых строк, включая последнюю известную строку, скрещиваются
+с наборами лагов `[1,5]`, `[1,5,20]` и `[1,2,5,10,20]`. Во всех девяти ячейках
+веса пяти групп вычисляет обучаемый ценовой gate. На одну ячейку приходится
+30 пар тикер–seed. Сохранённый `mean5` служит справочным ориентиром.
+
+Для каждой группы берётся среднее исходных 384-мерных MiniLM-векторов с
+float32 L1 ≥ 1e-6 в последних W строках. Отдельная `Linear(384,3)` выдаёт поправку
+на три горизонта. Маска применяется после головы и обнуляет весь вклад пустой
+группы, включая bias. Ценовые признаки в заданном порядке лагов —
+`concat(OHLC[t] − OHLC[t−L])` в нормализованном масштабе. Gate —
+`softmax(Linear(4*len(lags)+10,5))`, с десятью нулевыми входами совместимости
+и нулевой начальной инициализацией. Blend использует 0.9 прогноза FiLM
+и 0.1 суммы последнего OHLC и взвешенной поправки. Веса оставшихся групп
+сохраняются при пропусках. Ценовое окно в 64 строки, scaler по train,
+временные разбиения и бюджет 50 эпох с patience 10 взяты из очереди xTime.
+
+`run_context_price_mean_lag_grid.sh` запускает девять NVDA smoke checks, затем
+основную очередь. Результаты хранятся в `context_price_mean_lag_grid_10_v1`,
+запуски — в `{checks,full}/{cell}/{ticker}/seed{seed}/output`. Каталог очереди
+защищён блокировкой. Возобновление проверяет завершённые прогоны, SHA и настройки.
+Неудачные попытки сохраняются отдельно, с номером и журналом.
+
+Контроль W20/[1,5] берётся из normal-фазы xTime по пути
+`group_memory_ablation_720_v1/phases/full/xtime_group/w20_price_only/<TICKER>/seed<SEED>/normal`.
+Аудит сверяет бюджет обучения, режим normal-only, хэши артефактов, данные, scaler,
+окна, начальные параметры, порядок батчей и прогноз на одинаковых весах.
+Все 30 контролей прошли — очередь обучит 240 основных моделей. Любой отказ
+или `--force-matched-control` — очередь обучит 270, включая все 30 matched-контролей.
+Решение, причины и хэши сохраняются в `reused_control.json`
+или `matched_control.json`. Девять проверок идут сверх этих чисел.
+
+`analyze_context_price_mean_lag_grid.py` пишет отчёт в
+`diagnostics/mean_lag_grid` под корнем очереди. CSV содержат результаты по ячейкам,
+парам тикер–seed, тикерам, переходам при фиксированных лагах и при фиксированном окне.
+Победитель выбирается по среднему validation MSE. Выигрыш Test MSE вычисляется как
+`100 * (1 - error/reference)`. Для исходного FiLM с общей текстовой головой
+используется заданный знаменатель 0.015328073783851212, целевой Test MSE
+для снижения на 20% — 0.01226246. Статус сопоставимости и причины сохраняются
+вместе с численными сравнениями. Для повторного анализа укажите новый `--output`.
+
+Пример одиночного запуска из каталога кода в существующем контейнере. Выберите
+свободный каталог для `--logdir` и передайте полный SHA через `CODE_COMMIT`.
+
+```bash
+export PYTHONPATH="$PWD:$PWD/forecasting_task${PYTHONPATH:+:$PYTHONPATH}"
+export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+python -u -m forecasting_task.run \
+  --root_path /auto/datasets/kondyurin/FinTexTS/minilm_reproduction_v1/fintexts \
+  --data_path AAPL.parquet --model_type FiLM --text_family mean_price_grid \
+  --text_window 20 --price_gate_lags 1,5,20 --group_gate context_price_only \
+  --used_col_prefixes macro,sector,targetCompany,relatedCompany,filing \
+  --seq_len 64 --label_len 16 --pred_len 3 --batch_size 32 --e_layers 2 \
+  --text_num_layers 1 --text_hidden_size 64 --text_weight 0.1 --fusion_mode blend \
+  --lr 0.001 --num_epoch 50 --patience 10 --seed 7 \
+  --logdir /auto/datasets/kondyurin/FinTexTS/runs/context_price_mean_lag_single_v1/output
+```

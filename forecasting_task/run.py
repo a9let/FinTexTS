@@ -72,9 +72,10 @@ def parse_args(argv=None):
     parser.add_argument("--group_weight_mode", choices=["learnable", "fixed_uniform"], default=None)
     parser.add_argument("--group_gate", choices=["static", "context_novelty", "context_no_novelty", "context_price_only"], default=None,
                         help="Separate fixed-alpha=0.1 anchored group-gating experiment")
-    parser.add_argument("--text_family", choices=["han", "huang", "tlstm", "last", "memto_group", "titans_linear_group", "xtime_group"], default=None)
+    parser.add_argument("--text_family", choices=["han", "huang", "tlstm", "last", "memto_group", "titans_linear_group", "xtime_group", "mean_price_grid"], default=None)
     parser.add_argument("--family_hidden_size", type=int, choices=[8, 16, 32], default=32)
-    parser.add_argument("--text_window", type=int, choices=[5, 20], default=20)
+    parser.add_argument("--text_window", type=int, default=20)
+    parser.add_argument("--price_gate_lags", default=None, help="Ordered comma-separated OHLC lags for mean_price_grid")
     parser.add_argument("--group_weight_condition", choices=["price_only", "uniform"], default="price_only")
     parser.add_argument("--kd_beta", type=float, choices=[0., .5], default=0.)
     parser.add_argument("--memory_cache", default=None)
@@ -120,6 +121,21 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.text_family == "mean_price_grid":
+        from forecasting_task.models.GroupText import validate_price_lags
+        try:
+            supplied = "1,5" if args.price_gate_lags is None else args.price_gate_lags
+            args.price_gate_lags = list(validate_price_lags([int(lag) for lag in supplied.split(",")], args.seq_len))
+        except ValueError as error:
+            parser.error(f"Invalid --price_gate_lags: {error}")
+        if not 1 <= args.text_window <= args.seq_len:
+            parser.error("--text_window must be positive and at most seq_len")
+        if args.group_weight_condition != "price_only" or args.family_hidden_size != 32:
+            parser.error("mean_price_grid uses price_only and the default family_hidden_size")
+    else:
+        if args.price_gate_lags is not None or args.text_window not in (5,20):
+            parser.error("Custom text windows and price gate lags require mean_price_grid")
+        del args.price_gate_lags
     if args.text_family in ("memto_group", "xtime_group") and not args.memory_cache:
         parser.error("--memory_cache is required for phased experiments")
     if args.memory_progress and args.text_family not in ("memto_group", "titans_linear_group", "xtime_group"):
@@ -151,7 +167,8 @@ def parse_args(argv=None):
             parser.error("Huang requires context_price_only and recurrent_steps + attention_lookback <= seq_len")
     elif huang_parameters != HUANG_DEFAULTS:
         parser.error("Nondefault --huang_* parameters require a Huang query mode")
-    if args.text_temporal_pool not in ("last", "last_matched", *HUANG_ALL_MODES) and (args.group_gate != "context_price_only" or args.seq_len < 20):
+    if (args.text_family != "mean_price_grid" and args.text_temporal_pool not in ("last", "last_matched", *HUANG_ALL_MODES)
+            and (args.group_gate != "context_price_only" or args.seq_len < 20)):
         parser.error("temporal text modes require context_price_only and seq_len>=20")
     if args.text_temporal_pool == "last_matched" and args.group_gate != "context_price_only":
         parser.error("last_matched requires context_price_only")
@@ -159,8 +176,10 @@ def parse_args(argv=None):
         args.group_weight_mode = "fixed_uniform" if args.group_gate else "learnable"
     if args.group_gate:
         if (args.model_type.lower() != "film" or args.text_weight != 0.1 or args.fusion_mode != "blend"
-                or args.group_weight_mode != "fixed_uniform" or args.seq_len < 6):
-            parser.error("--group_gate requires FiLM, alpha=0.1, blend, fixed_uniform and seq_len>=6")
+                or args.group_weight_mode != "fixed_uniform"):
+            parser.error("--group_gate requires FiLM, alpha=0.1, blend and fixed_uniform")
+        if args.text_family != "mean_price_grid" and args.seq_len < 6:
+            parser.error("--group_gate requires seq_len>=6")
         if not args.code_commit:
             try:
                 args.code_commit = subprocess.check_output(
@@ -216,7 +235,14 @@ def parse_args(argv=None):
                 from forecasting_task.models.GroupGateExperiment import experiment_structure
                 parameters = dict(text_family=args.text_family, family_hidden_size=args.family_hidden_size,
                                   text_window=args.text_window, group_weight_condition=args.group_weight_condition)
-                args.temporal_pool_structure = experiment_structure(args.text_family, args.family_hidden_size, args.text_window, args.group_weight_condition, args.pred_len, args.kd_beta)
+                if args.text_family == "mean_price_grid":
+                    parameters["price_gate_lags"] = args.price_gate_lags
+                    gate_width = 4 * len(args.price_gate_lags) + 10
+                    args.gate_structure.update(in_features=gate_width, parameters=(gate_width+1)*5)
+                args.temporal_pool_structure = experiment_structure(
+                    args.text_family, args.family_hidden_size, args.text_window,
+                    args.group_weight_condition, args.pred_len, args.kd_beta,
+                    **{key: parameters[key] for key in ("price_gate_lags",) if key in parameters})
                 if args.text_family in ("memto_group", "titans_linear_group", "xtime_group"):
                     parameters["kd_beta"] = args.kd_beta
                 if args.group_weight_condition == "uniform":
@@ -661,6 +687,8 @@ def main(argv=None):
                         checkpoint.update(experiment_initialization=args.experiment_initialization, initial_prediction_evidence=None,
                                           text_family=args.text_family, family_hidden_size=args.family_hidden_size,
                                           text_window=args.text_window, group_weight_condition=args.group_weight_condition)
+                        if args.text_family == "mean_price_grid":
+                            checkpoint["price_gate_lags"] = args.price_gate_lags
                     if hasattr(args, "head_ablation_initialization"):
                         checkpoint.update(head_ablation_initialization=args.head_ablation_initialization,
                                           initial_prediction_evidence=args.initial_prediction_evidence)
@@ -808,6 +836,8 @@ def main(argv=None):
             summary.update(experiment_initialization=args.experiment_initialization, initial_prediction_evidence=None, text_family=args.text_family,
                            family_hidden_size=args.family_hidden_size, text_window=args.text_window,
                            group_weight_condition=args.group_weight_condition)
+            if args.text_family == "mean_price_grid":
+                summary["price_gate_lags"] = args.price_gate_lags
         if hasattr(args, "head_ablation_initialization"):
             summary.update(head_ablation_initialization=args.head_ablation_initialization,
                            initial_prediction_evidence=args.initial_prediction_evidence)

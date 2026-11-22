@@ -22,12 +22,13 @@ def configuration_issues(run, summary, args, checkpoint):
     if args.get('data_path') != run.ticker + '.parquet' or args.get('seed') != run.seed:
         mismatch.append('ticker/seed')
     keys = ('text_family','family_hidden_size','text_window','group_weight_condition')
+    optional = {'price_gate_lags': args['price_gate_lags']} if 'price_gate_lags' in args else {}
     try:
-        structure = experiment_structure(*(args[k] for k in keys), args['pred_len'], args.get('kd_beta',0.))
+        structure = experiment_structure(*(args[k] for k in keys), args['pred_len'], args.get('kd_beta',0.), **optional)
     except (KeyError,ValueError) as error:
         return missing, mismatch+[str(error)]
     for name, source in (('args',args),('summary',summary),('checkpoint',checkpoint),('model_config',args.get('text_model_config',{}))):
-        for key, value in {'text_temporal_pool':MODE,'temporal_pool_structure':structure, **{k:args[k] for k in keys}}.items():
+        for key, value in {'text_temporal_pool':MODE,'temporal_pool_structure':structure, **{k:args[k] for k in keys}, **optional}.items():
             if key not in source:
                 missing.append(name+'.'+key)
             elif source[key] != value:

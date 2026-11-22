@@ -10,10 +10,22 @@ TEXT_GROUPS = ("macro", "sector", "targetCompany", "relatedCompany", "filing")
 EMBEDDING_SIZE = 384
 
 
-def price_context(price_window):
-    """Original normalized OHLC differences, in lag-1 then lag-5 order."""
-    return torch.cat((price_window[:, -1] - price_window[:, -2],
-                      price_window[:, -1] - price_window[:, -6]), dim=-1)
+DEFAULT_PRICE_LAGS = (1, 5)
+
+
+def validate_price_lags(lags, seq_len=None):
+    lags = tuple(lags)
+    if (not lags or any(type(lag) is not int or lag <= 0 for lag in lags)
+            or len(set(lags)) != len(lags)):
+        raise ValueError("price_gate_lags must contain unique positive integers")
+    if seq_len is not None and max(lags) >= seq_len:
+        raise ValueError("Every price gate lag must be smaller than seq_len")
+    return lags
+
+
+def price_context(price_window, lags=DEFAULT_PRICE_LAGS):
+    """Normalized OHLC differences in the specified lag order."""
+    return torch.cat([price_window[:, -1] - price_window[:, -1-lag] for lag in lags], dim=-1)
 
 
 def validate_initial_group_weights(values, num_groups):
@@ -188,7 +200,7 @@ class ContextNoveltyTextModel(nn.Module):
 
     def __init__(self, hidden_size, pred_len, num_layers, used_col_prefixes=TEXT_GROUPS,
                  initial_text_weight=0.1, fusion_mode="blend", initial_group_weights=None,
-                 group_gate="static"):
+                 group_gate="static", price_gate_lags=DEFAULT_PRICE_LAGS):
         super().__init__()
         if group_gate not in ("static", "context_novelty", "context_no_novelty", "context_price_only"):
             raise ValueError("Unknown group_gate condition")
@@ -198,6 +210,7 @@ class ContextNoveltyTextModel(nn.Module):
             raise ValueError("group_gate requires fixed alpha=0.1 and anchored blend")
         validate_fixed_uniform_weights(initial_group_weights, 5)
         self.used_col_prefixes, self.pred_len, self.group_gate = TEXT_GROUPS, pred_len, group_gate
+        self.price_gate_lags = validate_price_lags(price_gate_lags)
         self.group_mlps = nn.ModuleDict({
             group: nn.Sequential(nn.Linear(EMBEDDING_SIZE, pred_len)) for group in TEXT_GROUPS
         })
@@ -206,7 +219,7 @@ class ContextNoveltyTextModel(nn.Module):
         if group_gate != "static":
             # Linear's default initialization must not advance other RNG streams.
             with torch.random.fork_rng(devices=[]):
-                self.gate = nn.Linear(18, 5)
+                self.gate = nn.Linear(4 * len(self.price_gate_lags) + 10, 5)
             nn.init.zeros_(self.gate.weight)
             nn.init.zeros_(self.gate.bias)
 
@@ -233,11 +246,14 @@ class ContextNoveltyTextModel(nn.Module):
         if (price_output.ndim != 3 or price_output.shape != (batch, self.pred_len, 4)
                 or last_price.shape != (batch, 4)):
             raise ValueError("Expected OHLC price output [batch,pred_len,4] and last_price [batch,4]")
-        if price_window.ndim != 3 or price_window.shape[0] != batch or price_window.shape[1] < 6 or price_window.shape[2] != 4:
-            raise ValueError("Price context requires at least six input OHLC rows")
+        if (price_window.ndim != 3 or price_window.shape[0] != batch
+                or price_window.shape[1] <= max(self.price_gate_lags) or price_window.shape[2] != 4):
+            if self.price_gate_lags == DEFAULT_PRICE_LAGS:
+                raise ValueError("Price context requires at least six input OHLC rows")
+            raise ValueError("Price window does not cover the requested OHLC lags")
         if novelty.shape != (batch, 5) or pair_available.shape != (batch, 5):
             raise ValueError("Expected novelty and pair_available [batch,5]")
-        context = price_context(price_window)
+        context = price_context(price_window, self.price_gate_lags)
         novelty_used = torch.zeros_like(novelty) if self.group_gate in ("context_no_novelty", "context_price_only") else novelty
         pair_available_used = torch.zeros_like(pair_available) if self.group_gate == "context_price_only" else pair_available
         features = torch.cat((context, novelty_used, pair_available_used), dim=-1)

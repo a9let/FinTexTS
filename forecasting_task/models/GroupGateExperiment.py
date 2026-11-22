@@ -2,18 +2,25 @@
 
 import torch
 from torch import nn
-from forecasting_task.models.GroupText import ContextNoveltyTextModel, TEXT_GROUPS
+from forecasting_task.models.GroupText import ContextNoveltyTextModel, TEXT_GROUPS, DEFAULT_PRICE_LAGS, validate_price_lags
 from forecasting_task.models.HANHeadAblation import HANHeadAblationTextModel, head_ablation_structure
 from forecasting_task.models.GroupHuangQuery import GroupHuangQueryTextModel, HUANG_REPLACE, huang_structure
 from forecasting_task.models.GroupTLSTM import GroupTLSTM
-from forecasting_task.models.GroupMemory import FAMILIES, PrototypeMemory, LinearMemory, ExpertRouter
+from forecasting_task.models.GroupMemory import FAMILIES, PrototypeMemory, LinearMemory, ExpertRouter, masked_group_mean
 
 
 MODE = 'group_gate_experiment'
+MEAN_GRID = 'mean_price_grid'
 SOURCES = {'han': '6a62808', 'huang': 'e642a6d', 'tlstm': 'Baytas KDD2017 section 3.1.2'}
 
 
-def experiment_structure(family, hidden, window, weights, pred_len=3, kd_beta=0.):
+def experiment_structure(family, hidden, window, weights, pred_len=3, kd_beta=0., price_gate_lags=DEFAULT_PRICE_LAGS):
+    if family == MEAN_GRID:
+        if type(window) is not int or window < 1 or hidden != 32 or weights != 'price_only' or kd_beta:
+            raise ValueError('Mean price grid expects a positive window and price_only weighting')
+        return {'mode': MODE, 'family': family, 'hidden': hidden, 'window': window, 'group_weights': weights,
+                'price_gate_lags': list(validate_price_lags(price_gate_lags)),
+                'head_structure': [{'type': 'Linear', 'in_features': 384, 'out_features': pred_len}]}
     if family in FAMILIES:
         if (window not in (5,20) or weights not in ('price_only','uniform')
                 or hidden not in ((8,16) if family == 'memto_group' else (16,32) if family == 'titans_linear_group' else (32,))
@@ -36,13 +43,15 @@ def experiment_structure(family, hidden, window, weights, pred_len=3, kd_beta=0.
 
 class GroupGateExperiment(nn.Module):
     def __init__(self, *, text_family, family_hidden_size, text_window, group_weight_condition,
-                 temporal_pool_structure=None, kd_beta=0., **config):
+                 temporal_pool_structure=None, kd_beta=0., price_gate_lags=DEFAULT_PRICE_LAGS, **config):
         super().__init__()
         self.family, self.hidden, self.window, self.weights_mode = text_family, family_hidden_size, text_window, group_weight_condition
-        expected = experiment_structure(self.family, self.hidden, self.window, self.weights_mode, config['pred_len'], kd_beta)
+        expected = experiment_structure(self.family, self.hidden, self.window, self.weights_mode, config['pred_len'], kd_beta, price_gate_lags)
         if temporal_pool_structure is not None and temporal_pool_structure != expected:
             raise ValueError('Saved family/weight structure differs')
         config['group_gate'] = 'context_price_only'
+        if self.family == MEAN_GRID:
+            config['price_gate_lags'] = price_gate_lags
         if self.family == 'huang':
             self.core = GroupHuangQueryTextModel(text_temporal_pool=HUANG_REPLACE, huang_hidden_size=self.hidden,
                         huang_recurrent_steps=self.window, huang_attention_lookback=10, **config)
@@ -95,6 +104,8 @@ class GroupGateExperiment(nn.Module):
                  'text_window': self.window, 'group_weight_condition': self.weights_mode}
         if self.weights_mode == 'uniform':
             state['fixed_group_coefficients'] = dict.fromkeys(TEXT_GROUPS,.2)
+        if self.family == MEAN_GRID:
+            state['price_gate_lags'] = list(self.core.price_gate_lags)
         return state
 
     def forward(self, price_output, last_price, embeddings, *, text_window, price_window,
@@ -104,6 +115,17 @@ class GroupGateExperiment(nn.Module):
             return self.core(price_output, last_price, embeddings, text_window=text_window, **kwargs)
         if self.family == 'last':
             return self.core(price_output, last_price, embeddings, **kwargs)
+        if self.family == MEAN_GRID:
+            if text_window.shape[:2] != price_window.shape[:2] or text_window.shape[1] < self.window:
+                raise ValueError('Mean pooling requires aligned input windows covering W rows')
+            text = text_window[:, -self.window:].float()
+            present = text.abs().sum(-1) >= 1e-6
+            result = self.core(price_output, last_price, masked_group_mean(text, present),
+                               group_present=present.any(1), **kwargs)
+            if return_details:
+                prediction, detail = result
+                return prediction, {**detail, 'mean_present': present}
+            return result
         if self.family in FAMILIES:
             return self.memory_forward(price_output, last_price, embeddings, text_window, kwargs)
         if text_window.shape[:2] != price_window.shape[:2] or calendar_days is None:

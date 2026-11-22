@@ -117,6 +117,10 @@ class LinearMemory(nn.Module):
         return final, torch.cat((torch.stack(norms, 1)[..., None], coeff), -1)*present[..., None]
 
 
+def masked_group_mean(text, present):
+    return (text * present[..., None]).sum(1) / present.sum(1).clamp_min(1)[..., None]
+
+
 class ExpertRouter(nn.Module):
     def __init__(self, pred_len, normal_heads):
         super().__init__()
@@ -127,7 +131,7 @@ class ExpertRouter(nn.Module):
         self.register_buffer("normal_only", torch.tensor(True))
 
     def outputs(self, text, present, only_normal=False):
-        pooled = (text * present[..., None]).sum(1) / present.sum(1).clamp_min(1)[..., None]
+        pooled = masked_group_mean(text, present)
         experts = self.experts[:1] if only_normal else self.experts
         return torch.stack([torch.stack([expert[g](pooled[:, i]) for i,g in enumerate(TEXT_GROUPS)],1)
                             for expert in experts],1)

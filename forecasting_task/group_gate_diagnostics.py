@@ -11,6 +11,8 @@ def records(dataset, indices, film, last, output, detail, alpha, family):
     parts = [x.detach().cpu().numpy() for x in (film_part, anchor, text, output, film_part+anchor+text)]
     groups, dates, components = {}, [], []
     window = a['tlstm_present'].shape[1] if family == 'tlstm' else a['memory_present'].shape[1] if 'memory_present' in a else 1
+    if 'mean_present' in a:
+        window = a['mean_present'].shape[1]
     for sample, index in enumerate(indices):
         end = index + dataset.seq_len
         for g, group in enumerate(TEXT_GROUPS):
@@ -23,6 +25,8 @@ def records(dataset, indices, film, last, output, detail, alpha, family):
                         'date': str(date), 'present': int(a['tlstm_present'][sample,row,g] if family == 'tlstm' else a['present'][sample,g])}
                 if family == 'tlstm':
                     item.update(delta_days=float(a['tlstm_delta'][sample,row,g]), decay=float(a['tlstm_decay'][sample,row,g]))
+                if 'mean_present' in a:
+                    item['present'] = int(a['mean_present'][sample,row,g])
                 if 'memory_present' in a:
                     names = ('lsd','isd','anomaly') if family == 'memto_group' else ('gradient_norm','alpha','eta','theta')
                     item['present'] = int(a['memory_present'][sample,row,g])
