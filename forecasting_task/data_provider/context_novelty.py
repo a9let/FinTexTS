@@ -164,7 +164,12 @@ def gate_batch_inputs(metadata, text, device, *, use_window):
 def get_context_novelty_dataloader(batch_size, **kwargs):
     include_days = kwargs.pop('include_calendar_days', False)
     extended_text_window = kwargs.pop('extended_text_window', None)
-    dataset = ContextNoveltyDataset(Dataset_Custom(**kwargs), include_calendar_days=include_days,
+    matched_baseline = kwargs.pop('matched_baseline', False)
+    factory = ContextNoveltyDataset
+    if matched_baseline:
+        from forecasting_task.mean_router_protocol import BaselineDataset
+        factory = BaselineDataset
+    dataset = factory(Dataset_Custom(**kwargs), include_calendar_days=include_days,
                                     extended_text_window=extended_text_window)
     train = kwargs["flag"] == "train"
     return dataset, DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=1, drop_last=train)

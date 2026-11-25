@@ -1,5 +1,8 @@
 # FinTexTS
 
+The opt-in Q1-selected mean experts and frozen-router experiment is described
+in [MEAN_ROUTER.md](MEAN_ROUTER.md), including publication, astra, resume and analysis commands.
+
 The optional 720-run MEMTO, linear Titans and xTime experiments are
 documented in [MEMORY_ABLATION.md](MEMORY_ABLATION.md).
 

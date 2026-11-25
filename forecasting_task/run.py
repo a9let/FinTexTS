@@ -40,6 +40,10 @@ def _parse_used_col_prefixes(value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="forecasting_task runner")
+    parser.add_argument("--selection_protocol", choices=["original", "temporally_separated"], default="original")
+    parser.add_argument("--matched_original_baseline", action="store_true")
+    parser.add_argument("--protocol_resume", action="store_true")
+    parser.add_argument("--save_epochs", type=int, nargs="*", default=[])
     parser.add_argument("--task_name", default="short_term_forecast")
     parser.add_argument("--seq_len", type=int, default=64)
     parser.add_argument("--pred_len", type=int, default=3)
@@ -121,6 +125,17 @@ def parse_args(argv=None):
                         help='down sampling method, only support avg, max, conv')
     
     args = parser.parse_args(argv)
+    if args.selection_protocol == "temporally_separated":
+        from forecasting_task.mean_router_protocol import BASE_SHA, PERIODS
+        args.protocol_base_sha = BASE_SHA
+        args.expert_selection_period = list(PERIODS["expert_selection"])
+        args.test_previously_inspected = True
+        if args.text_family != "mean_price_grid":
+            parser.error("temporally_separated requires the mean_price_grid configuration")
+        if any(epoch < 1 or epoch > args.num_epoch for epoch in args.save_epochs):
+            parser.error("--save_epochs must lie inside the training budget")
+    elif args.matched_original_baseline or args.protocol_resume or args.save_epochs:
+        parser.error("Protocol options require temporally_separated")
     if args.text_family == "mean_price_grid":
         from forecasting_task.models.GroupText import validate_price_lags
         try:
@@ -263,11 +278,14 @@ def parse_args(argv=None):
     args.d_layers = args.e_layers
     args.p_hidden_dims = [128,128]
     args.p_hidden_layers = 2
-    if os.path.isdir(args.logdir) and os.listdir(args.logdir):
+    if os.path.isdir(args.logdir) and os.listdir(args.logdir) and not args.protocol_resume:
         raise FileExistsError(
             f"Output directory is not empty: {args.logdir}. "
             "Choose a new --logdir."
     )
+    if (args.protocol_resume and os.path.isdir(args.logdir) and os.listdir(args.logdir)
+            and not Path(args.logdir, "last_checkpoint.pt").is_file()):
+        raise ValueError("Resume requires last_checkpoint.pt in a nonempty output directory")
     os.makedirs(args.logdir, exist_ok=True)
     
     return args
@@ -401,6 +419,8 @@ def main(argv=None):
         if args.text_family is not None:
             from functools import partial
             loader_factory = partial(loader_factory, include_calendar_days=True)
+            if args.matched_original_baseline:
+                loader_factory = partial(loader_factory, matched_baseline=True)
             if args.text_family == "mean_price_grid" and args.text_window > args.seq_len:
                 loader_factory = partial(loader_factory, extended_text_window=args.text_window)
     train_dataset, train_dataloader = loader_factory(
@@ -479,8 +499,16 @@ def main(argv=None):
         raise ValueError(f"Invalid model type: {args.model_type}")
     model = model.to(device)
     
-    text_model = build_text_model(args.text_model_config, args.group_weight_mode).to(device)
-    if args.group_gate == "context_price_only":
+    if args.matched_original_baseline:
+        from forecasting_task.mean_router_protocol import MatchedBaseline
+        text_model = MatchedBaseline(args.pred_len).to(device)
+        args.baseline_source = "db35a2d joint 384->3 after mean of five groups"
+        from forecasting_task.experiment_evidence import state_fingerprint
+        args.common_initialization = {"film_sha256": state_fingerprint(model),
+                                      "joint_head_sha256": state_fingerprint(text_model)}
+    else:
+        text_model = build_text_model(args.text_model_config, args.group_weight_mode).to(device)
+    if args.group_gate == "context_price_only" and not args.matched_original_baseline:
         from forecasting_task.experiment_evidence import common_initialization, source_data_evidence, state_fingerprint
         args.common_initialization = common_initialization(model, text_model)
         args.temporal_initialization_sha256 = state_fingerprint(text_model.temporal_pool) if hasattr(text_model, "temporal_pool") else None
@@ -521,12 +549,23 @@ def main(argv=None):
     elif args.group_weight_mode == "fixed_uniform":
         args.fixed_group_coefficients = text_model.fixed_group_coefficients()
     # FiLM also records its fixed ratio on args during construction.
-    with open(os.path.join(args.logdir, "args.yaml"), "w", encoding="utf-8") as f:
-        yaml.safe_dump(vars(args), f, sort_keys=False)
+    if not (args.protocol_resume and Path(args.logdir, "args.yaml").exists()):
+        args_path = Path(args.logdir, "args.yaml")
+        temporary_args = args_path.with_suffix(".yaml.tmp") if args.selection_protocol != "original" else args_path
+        with open(temporary_args, "w", encoding="utf-8") as f:
+            yaml.safe_dump(vars(args), f, sort_keys=False)
+        if temporary_args != args_path:
+            os.replace(temporary_args, args_path)
 
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(text_model.parameters()), lr=args.lr
     )
+    if args.selection_protocol == "temporally_separated":
+        from forecasting_task.mean_router_protocol import train_selected
+        import sys
+        return train_selected(sys.modules[__name__], args, model, text_model, optimizer,
+            dict(train=train_dataset, val=val_dataset, test=test_dataset),
+            dict(train=train_dataloader, val=val_dataloader, test=test_dataloader), train_generator, device)
 
     best_val = float("inf")
     best_text_alpha = None
