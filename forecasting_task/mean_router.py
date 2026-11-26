@@ -136,7 +136,7 @@ def full_batch_step(model, optimizer, train, mean, scale, generator, batch_size,
 
 
 def fit_router(cache, root, mode, seed, *, lr=.001, epochs=200, patience=20, batch_size=128,
-               regularization=.001, resume=False):
+               regularization=.001, resume=False, include_initial=False, provenance=None):
     validate_cache(cache)
     if cache['source'].get('split','val') != 'val':
         raise ValueError('Router fitting requires a validation cache, never test')
@@ -150,12 +150,19 @@ def fit_router(cache, root, mode, seed, *, lr=.001, epochs=200, patience=20, bat
     generator = torch.Generator().manual_seed(seed)
     signature = dict(mode=mode, seed=seed, lr=lr, epochs=epochs, patience=patience, batch_size=batch_size,
                      regularization=regularization, cache=cache['hashes'], source=cache['source'], schema=SCHEMA)
+    if include_initial:
+        signature['include_initial'] = True
+    if provenance is not None:
+        signature['provenance'] = provenance
+    artifacts = {'best_checkpoint.pt','last_checkpoint.pt','history.json','summary.json'}
+    if include_initial:
+        artifacts.add('initial_checkpoint.pt')
     first, best, wait, history, optimizer_steps = 1, float('inf'), 0, [], 0
     if (root/'completed.json').exists():
         completed = json.loads((root/'completed.json').read_text())
         if completed['signature'] != signature:
             raise ValueError('Completed router configuration/cache differs')
-        if set(completed.get('artifacts',{})) != {'best_checkpoint.pt','last_checkpoint.pt','history.json','summary.json'}:
+        if set(completed.get('artifacts',{})) != artifacts:
             raise ValueError('Incomplete router completion marker')
         for name,digest in completed['artifacts'].items():
             if file_hash(root/name)!=digest:
@@ -173,8 +180,9 @@ def fit_router(cache, root, mode, seed, *, lr=.001, epochs=200, patience=20, bat
             raise ValueError('Router has no scheduler; incompatible saved scheduler state')
         if saved.get('optimization_mode') != 'full_batch' or saved.get('optimizer_steps') != saved['epoch']:
             raise ValueError('Router full-batch optimizer step evidence is inconsistent')
-        if (not saved['optimizer']['state'] or any(int(state['step']) != saved['optimizer_steps']
-                                                  for state in saved['optimizer']['state'].values())):
+        if ((saved['optimizer_steps'] == 0 and (not include_initial or saved['optimizer']['state']))
+                or (saved['optimizer_steps'] > 0 and (not saved['optimizer']['state'] or any(
+                    int(state['step']) != saved['optimizer_steps'] for state in saved['optimizer']['state'].values())))):
             raise ValueError('AdamW state step counter differs from the recorded optimizer steps')
         if not torch.equal(saved['generator'], saved['rng']['generator']):
             raise ValueError('Router generator states disagree')
@@ -185,6 +193,28 @@ def fit_router(cache, root, mode, seed, *, lr=.001, epochs=200, patience=20, bat
         restore_rng(saved['rng'], generator)
         optimizer_steps = saved['optimizer_steps']
         first, best, wait, history = saved['epoch']+1, saved['best'], saved['wait'], saved['history']
+    elif include_initial:
+        if any(root.iterdir()):
+            raise ValueError('Incomplete new fit has no last checkpoint; preserve and inspect its files')
+        with torch.no_grad():
+            initial_prediction = model(val['predictions'], (val['features']-mu)/sigma)
+            torch.testing.assert_close(initial_prediction, val['predictions'].mean(1), rtol=1e-5, atol=1e-6)
+            best = equal_ticker_mse(initial_prediction, val['targets'], val['ticker']).item()
+            train_mse = equal_ticker_mse(model(train['predictions'], (train['features']-mu)/sigma),
+                                         train['targets'], train['ticker']).item()
+        history = [dict(epoch=0, optimizer_steps=0, initial=True,
+                        router_train_mse=train_mse, router_validation_mse=best)]
+        state = dict(signature=signature, epoch=0, best=best, wait=0, history=history,
+                     model=copy.deepcopy(model.state_dict()), optimizer=optimizer.state_dict(),
+                     generator=generator.get_state(), rng=capture_rng(generator),
+                     scheduler_state_dict=None, optimization_mode='full_batch', optimizer_steps=0,
+                     scaler_mean=mu, scaler_scale=sigma)
+        atomic_save(root/'initial_checkpoint.pt', state)
+        atomic_save(root/'best_checkpoint.pt', state)
+        atomic_save(root/'last_checkpoint.pt', state)
+        atomic_json(root/'history.json', history)
+        print(f'ROUTER mode={mode} seed={seed} steps=0/{epochs} train_mse={train_mse:.8f} '
+              f'Q4_mse={best:.8f} best_step=0 patience=0/{patience}',flush=True)
     for epoch in range(first, epochs+1):
         if wait >= patience:
             break
@@ -207,11 +237,16 @@ def fit_router(cache, root, mode, seed, *, lr=.001, epochs=200, patience=20, bat
             atomic_save(root/'best_checkpoint.pt', state)
         atomic_save(root/'last_checkpoint.pt', state)
         atomic_json(root/'history.json', history)
-        print(f'ROUTER epoch={epoch}/{epochs} train_mse={train_mse:.8f} Q4_mse={mse:.8f} patience={wait}',flush=True)
+        best_step = min(history,key=lambda row:row['router_validation_mse'])['epoch']
+        print(f'ROUTER mode={mode} seed={seed} steps={epoch}/{epochs} train_mse={train_mse:.8f} '
+              f'Q4_mse={mse:.8f} best_step={best_step} patience={wait}/{patience}',flush=True)
     selected = torch.load(root/'best_checkpoint.pt', weights_only=True)
     atomic_json(root/'summary.json', dict(optimization_mode='full_batch', optimizer_steps=optimizer_steps,
-        epochs_completed=len(history), best_epoch=selected['epoch'],
+        epochs_completed=optimizer_steps, best_epoch=selected['epoch'],
         best_optimizer_steps=selected['optimizer_steps'], scheduler=None))
     atomic_json(root/'completed.json', dict(signature=signature,best_sha256=file_hash(root/'best_checkpoint.pt'),
-        artifacts={name:file_hash(root/name) for name in ('best_checkpoint.pt','last_checkpoint.pt','history.json','summary.json')}))
+        artifacts={name:file_hash(root/name) for name in sorted(artifacts)}))
+    if include_initial:
+        model.load_state_dict(selected['model'])
+        return model.eval()
     return model

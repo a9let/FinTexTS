@@ -1,5 +1,8 @@
 # FinTexTS
 
+The cache-only nine-fit router budget check is described in
+[ROUTER_BUDGET.md](ROUTER_BUDGET.md).
+
 The opt-in Q1-selected mean experts and frozen-router experiment is described
 in [MEAN_ROUTER.md](MEAN_ROUTER.md), including publication, astra, resume and analysis commands.
 
